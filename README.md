@@ -1,3 +1,3 @@
 # Bonus-idrico
-Benvenuti nella gestione delle anomalie del Progetto  
-Andate nella sezione Issues per visualizzare ed aprire nuove anomalie.
+Benvenuti nella gestione delle anomalie del Progetto!  
+Nella sezione Issues potete visualizzare ed aprire nuove anomalie.
