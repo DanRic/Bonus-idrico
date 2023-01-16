@@ -1,0 +1,2601 @@
+CREATE OR REPLACE PACKAGE BODY KPI_GESTIONE_INDEN_INS AS
+  --
+ /*************************************
+%PCMS_HEADER_SUBSTITUTION_START%
+Name %PM%
+Description %PD%
+Revision %PR%
+Author %PO%
+Date %PRT%
+ChDocs %PIRC%
+%PCMS_HEADER_SUBSTITUTION_END%
+****************************************/
+  --
+    K_ESITO_BL                     CONSTANT VARCHAR2(2)  := 'BL';
+    K_ESITO_KO                     CONSTANT VARCHAR2(16) := 'KO';
+    K_ESITO_OK                     CONSTANT VARCHAR2(16) := 'OK';
+    K_ESITO_DOPPIA                 CONSTANT VARCHAR2(16) := 'SD';
+    K_ESITO_IGNORA                 CONSTANT VARCHAR2(16) := 'IGNORA';
+    K_MENO_INFINITO                CONSTANT TIMESTAMP(6) := TO_TIMESTAMP('01010001','DDMMYYYY');
+    K_PIU_INFINITO                 CONSTANT TIMESTAMP(6) := TO_TIMESTAMP('31129999','DDMMYYYY');
+    K_NOME_PACKAGE                 CONSTANT VARCHAR2(50) := 'KPI_GESTIONE_INDEN_INS';
+    K_NO                           CONSTANT VARCHAR2(2)  := 'NO';
+    K_FA                           CONSTANT VARCHAR2(2)  := 'FA';
+    K_SI                           CONSTANT VARCHAR2(2)  := 'SI';
+    K_N                            CONSTANT VARCHAR2(2)  := 'N';
+    K_S                            CONSTANT VARCHAR2(2)  := 'S';
+    kLingua                        CONSTANT VARCHAR2(3)  := edw_sgn_pck.get_lingua;
+    -- RicF 08/07/2010
+    K_KPI_CHIUSO                   CONSTANT VARCHAR2(2)  := 'C';
+    PO_PARIN_DOCOUT                TAB_PARIN_DOCOUT_TY;
+    V_PARIN_DOCOUT                 REC_PARIN_DOCOUT_TY;
+--    V_SESSION_ID_GLOBAL            VARCHAR2(16);
+    GVL_ATTIVA                     varchar2(2)  := 'NO'; -- IMPOSTANO A SI QUESTA COSTANTE VERRA' ATTIVATA LA SCRITTURA LOG NELLA TABELLA KPI_LG_TEMP
+    GLOB_STATO_EVOLUZIONE          varchar2(20) := 'CREAZIONE_IND';
+    GLOB_ISTANZA                   varchar2(20) := 'INDENNIZZI';
+    GLOB_FLAG_SINGOLA_SCHEDA       VARCHAR2(5)  := K_NO;
+    kAccapo                        VARCHAR2(2)  := CHR(10);
+    --
+    --PROCEDURA CHE INSERISCE O AGGIORNA LO STATO DI UNA SCHEDA INDENNIZZO
+    --
+    PROCEDURE INSERISCI_STATI_INDENNIZZI(
+        PO_ERR_SEVERITA  IN OUT NOCOPY VARCHAR2,
+        PO_ERR_CODICE    IN OUT NOCOPY VARCHAR2,
+        PO_MESSAGGIO     IN OUT NOCOPY VARCHAR2,
+        P_LINGUAID       IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+        P_OPEID          IN     VARCHAR2,
+        P_RUOLOID        IN     VARCHAR2,
+        P_SUPERUSER      IN     VARCHAR2,
+        PO_EDW_PERMESSI  IN OUT NOCOPY XMLTYPE,
+        P_CONTESTO       IN     EDW_CONTESTO_API_PCK.T_CONTESTO,
+        P_DATAVERSIONE   IN     TIMESTAMP,
+        P_DECORRENZA     IN     TIMESTAMP,
+        PO_DML           IN OUT NOCOPY Edw_Qbe_Api_Pck.tListaQBE,
+        PO_ID               OUT NOCOPY VARCHAR2,--ID FISICO DELLO STATO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+        PO_STATO_PUBBLICO_COD   OUT NOCOPY VARCHAR2,--CODICE STATO PUBBLICO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+        PO_STATO_PUBBLICO_ID    OUT NOCOPY VARCHAR2,--ID STATO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+        PO_STATO_WKF_ID         OUT NOCOPY VARCHAR2,--ID STATO  WKF IN CUI ARRIVA LA SCHEDA INDENNIZZO
+        P_COMANDO_STATO  IN     VARCHAR2,
+        P_MODULO_ID      IN     KPI_KPI.KPI_KPI_ID%TYPE,
+        P_VERSIONING     IN     EDW_QBE_API_PCK.tBooleano := NULL, --<-- forza il versioning sempre/mai, null a seconda della parametrizzazion
+        P_BATCHMODE      IN     EDW_QBE_API_PCK.tBooleano := 'NO', --<-- In caso di metodo multiset, NO ferma al primo errore, SI elabora tutto
+        pUsaContesto     IN     EDW_QBE_API_PCK.tSiNo := 'SI',  --<-- NULL o SI usa tutte le informazioni del contesto, SEZ usa solo la sezione, NO non usare il contesto
+        pLinguaIdDes     IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE := NULL, --<-- se valorizzato tutte le descrizioni generate dal motore di qbe sono filtrate con questa lingua
+        P_GEST_LINGUA    IN     EDW_QBE_API_PCK.tBooleano := NULL, --<-- SI/NO Gestione della lingua
+        P_NOTE           IN     KPI_IND_REL_STATI.KIRS_NOTE%TYPE := NULL
+    )
+    IS
+        -- variabili locali
+        V_PROC_NAME           VARCHAR2(100) := K_NOME_PACKAGE|| '.INSERISCI_STATI_INDENNIZZI ';
+        VO_ERR_SEVERITA_DETT  WKF_GESTIONE.T_ARRAY_SEVERITA;
+        VO_ERR_CODICE_DETT    WKF_GESTIONE.T_ARRAY_CODE;
+        VO_MESSAGGIO_DETT     WKF_GESTIONE.T_ARRAY_MESSAGE;
+        VO_IGNORA_ERRORI      VARCHAR2(100);
+        --
+        V_OGG_STORICO_ID      WKF_GESTIONE.T_ARRAY_ID;
+        V_OGG_DATA_INI        WKF_GESTIONE.T_ARRAY_DATA_INI;
+        V_OGG_VERSIONE        WKF_GESTIONE.T_ARRAY_VERSIONE;
+        --
+        V_TAB_STORICO_ID      WKF_GESTIONE.T_ARRAY_ID;
+        V_TAB_DATA_INI        WKF_GESTIONE.T_ARRAY_DATA_INI;
+        V_TAB_VERSIONE        WKF_GESTIONE.T_ARRAY_VERSIONE;
+        --
+        V_DATA_EVOLUZIONE     WKF_GESTIONE.T_ARRAY_DATA_INI;
+        V_STATO_WORKFLOW_ID   WKF_GESTIONE.T_ARRAY_ID;
+        V_CWKF_COMANDO_COD    WKF_GESTIONE.T_ARRAY_COD;
+        --
+        V_TOG_STORICO_ID      WKF_GESTIONE.T_ARRAY_ID;
+        V_TOG_DATA_INI        WKF_GESTIONE.T_ARRAY_DATA_INI;
+        V_TOG_VERSIONE        WKF_GESTIONE.T_ARRAY_VERSIONE;
+        --
+        V_DATA_CREAZIONE      WKF_GESTIONE.T_ARRAY_DATA_INI;
+        --
+        VO_STATO_WORKFLOW_ID  WKF_GESTIONE.T_ARRAY_ID;
+        VO_STATO_PUBBLICO_ID  WKF_GESTIONE.T_ARRAY_ID;
+        V_DATA_MODIFICA       TIMESTAMP;
+        --
+        vFkInd EDW_QBE_API_PCK.tPk;
+        --
+        vFkSwkf EDW_QBE_API_PCK.tPk;
+        --
+        vFkSpwkf    EDW_QBE_API_PCK.tPk;
+        vOldFkSpwkf EDW_QBE_API_PCK.tPk;
+        vFkScin     EDW_QBE_API_PCK.tPk;
+        --
+        --
+        i                       BINARY_INTEGER;
+        vIdKIRS                 KPI_IND_REL_STATI.KIRS_IND_REL_STATO_ID%TYPE;
+        vNow                    TIMESTAMP(6) := SYSTIMESTAMP;
+        V_ERRORE EXCEPTION;
+        vPasso                  VARCHAR2(100) := 'INIT';
+    BEGIN
+      --
+      i := PO_DML.FIRST;
+      --
+      IF P_COMANDO_STATO IS NOT NULL THEN
+        --
+        vPasso := 'P_COMANDO_STATO:'||P_COMANDO_STATO;
+        --
+        vPasso := 'A-IdKIRS';
+        vIdKIRS := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE (PO_DML, 'StoricoIdKIRS', i);
+        If vIdKIRS IS NULL THEN
+          vIdKIRS := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE (PO_DML, 'IdKIRS', i);
+          KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdKIRS', vIdKIRS, i);
+        END IF;
+
+        -- Cerco l'ultimo record per l'indennizzo corrente e confronto lo stato con
+        -- quello ottenuto dal WKF
+        --
+        --
+        BEGIN
+         SELECT B.SPWKF_STATO_PUBBLICO_ID, B.SPWKF_DATA_INI, B.SPWKF_VERSIONE,
+                B.KIRS_IND_REL_STATO_ID , B.KIRS_DATA_INI, B.KIRS_VERSIONE,
+                B.KIRS_DATAMODIFICA, B.SWKF_STATO_WORKFLOW_ID
+           INTO vOldFkSpwkf.ID_STORICO, vOldFkSpwkf.DATA_INI, vOldFkSpwkf.VERSIONE,
+                vFkScin.ID_STORICO, vFkScin.DATA_INI, vFkScin.VERSIONE,
+                V_DATA_MODIFICA, vFkSwkf.ID_STORICO
+           FROM KPI_IND_REL_STATI B
+          WHERE KIRS_FLAG_ANN            = K_N
+            AND B.KIRS_DATA_VER_FIN      = K_PIU_INFINITO
+            AND B.KPI_KPI_ID             = P_MODULO_ID
+            AND B.KIRS_IND_REL_STATO_ID  = vIdKIRS;
+        EXCEPTION
+         WHEN NO_DATA_FOUND THEN
+          --se non trova lo stato precedente deve inserire e basta
+           vOldFkSpwkf.ID_STORICO:='xxxxxx';
+         WHEN TOO_MANY_ROWS THEN
+           PO_ERR_CODICE   := 'BILDOPR031';
+           BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+           RAISE V_ERRORE;
+         WHEN OTHERS THEN
+           PO_ERR_CODICE   := 'BILDOPR032';
+           BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+           RAISE V_ERRORE;
+        END;
+        --
+        --
+        -- ID/DI/VER TABELLA DOVE SI APPLICA IL WKF
+        V_OGG_STORICO_ID(1)    := vFkInd.ID_STORICO;
+        V_OGG_DATA_INI(1)      := vFkInd.DATA_INI  ;
+        V_OGG_VERSIONE(1)      := vFkInd.VERSIONE  ;
+        -- DATA VARIAZIONE STATO / STATO ATTUALE / COMANDO EVOLUZIONE STATO
+        V_DATA_EVOLUZIONE(1)   := systimestamp;
+        V_STATO_WORKFLOW_ID(1) := vFkSwkf.ID_STORICO;
+        V_CWKF_COMANDO_COD(1)  := P_COMANDO_STATO;
+        -- RICAVO TRIPLETTA STORICA TABELLA.
+        V_TAB_STORICO_ID(1)    := 'KPI_SCIN';
+        V_TAB_DATA_INI(1)      := K_MENO_INFINITO;
+        V_TAB_VERSIONE(1)      := 0;
+
+        -- APPLICO L'EVOLUZIONE DI STATO
+        vPasso := 'COMANDO_WORKFLOW_LITE_BY_FK';
+        WKF_GESTIONE.COMANDO_WORKFLOW_LITE_BY_FK (  PO_ERR_SEVERITA       =>  PO_ERR_SEVERITA,
+                                                   PO_ERR_CODICE         =>  PO_ERR_CODICE,
+                                                   PO_MESSAGGIO          =>  PO_MESSAGGIO,
+                                                   P_LINGUAID            =>  P_LINGUAID,
+                                                   P_OPEID               =>  P_OPEID,
+                                                   P_RUOLOID             =>  P_RUOLOID,
+                                                   P_SUPERUSER           =>  P_SUPERUSER,
+                                                   P_EDW_PERMESSI        =>  PO_EDW_PERMESSI,
+                                                   P_CONTESTO            =>  EDW_CONTESTO_API_PCK.SERIALIZZA(P_CONTESTO),
+                                                   P_DATAVERSIONE        =>  P_DATAVERSIONE,
+                                                   P_DECORRENZA          =>  P_DECORRENZA,
+                                                   --
+                                                   PO_ERR_SEVERITA_DETT  =>  VO_ERR_SEVERITA_DETT,
+                                                   PO_ERR_CODICE_DETT    =>  VO_ERR_CODICE_DETT,
+                                                   PO_MESSAGGIO_DETT     =>  VO_MESSAGGIO_DETT,
+                                                   PO_IGNORA_ERRORI      =>  VO_IGNORA_ERRORI,
+                                                   --
+                                                   P_TAB_STORICO_ID      =>  V_TAB_STORICO_ID,
+                                                   P_TAB_DATA_INI        =>  V_TAB_DATA_INI,
+                                                   P_TAB_VERSIONE        =>  V_TAB_VERSIONE,
+                                                   --
+                                                   P_OGG_STORICO_ID      =>  V_OGG_STORICO_ID,
+                                                   P_OGG_DATA_INI        =>  V_OGG_DATA_INI,
+                                                   P_OGG_VERSIONE        =>  V_OGG_VERSIONE,
+                                                   --
+                                                   P_DATA_EVOLUZIONE     =>  V_DATA_EVOLUZIONE,
+                                                   P_STATO_WORKFLOW_ID   =>  V_STATO_WORKFLOW_ID,
+                                                   P_CWKF_COMANDO_COD    =>  V_CWKF_COMANDO_COD,
+                                                   --
+                                                   PO_STATO_WORKFLOW_ID  =>  VO_STATO_WORKFLOW_ID,
+                                                   PO_STATO_PUBBLICO_ID  =>  VO_STATO_PUBBLICO_ID
+                                                );
+        --
+        IF PO_MESSAGGIO IS NOT NULL THEN  RAISE V_ERRORE; END IF;
+        --
+        -- GESTIONE ERRORI ALL' USCITA DALLA PROCEDURA DI AVANZAMENTO STATO WKF.
+        IF VO_ERR_SEVERITA_DETT.count > 0 THEN
+          --
+          PO_ERR_SEVERITA := VO_ERR_SEVERITA_DETT(VO_ERR_SEVERITA_DETT.first);
+          PO_ERR_CODICE   := VO_ERR_CODICE_DETT  (VO_ERR_CODICE_DETT.first);
+          PO_MESSAGGIO    := VO_MESSAGGIO_DETT   (VO_MESSAGGIO_DETT.first);
+          RETURN;
+          --
+        END IF;
+        --
+        -- RICAVO TRIPLETTA STORICA STATO WKF
+        vPasso := 'A-SWKF';
+        --
+        PO_STATO_WKF_ID := VO_STATO_WORKFLOW_ID(VO_STATO_WORKFLOW_ID.first);
+        vFkSwkf := WKFB_STATI_WORKFLOW_INF.GET_FK(PO_STATO_WKF_ID);
+        --
+        -- RICAVO TRIPLETTA STORICA STATO PUBBLICO WKF
+        vPasso := 'A-SPWKF';
+        -- Valorizzo il codice dello stato pubblico
+        BEGIN
+           vFkSpwkf.ID_STORICO := VO_STATO_PUBBLICO_ID(VO_STATO_PUBBLICO_ID.first);
+           SELECT SPWKF_STATO_PUBBLICO_COD, SPWKF_STATO_PUBBLICO_ID, SPWKF_DATA_INI, SPWKF_VERSIONE
+             INTO PO_STATO_PUBBLICO_COD, PO_STATO_PUBBLICO_ID, vFkSpwkf.DATA_INI, vFkSpwkf.VERSIONE
+             FROM WKFB_STATI_PUBBLICI
+            WHERE SPWKF_STATO_PUBBLICO_ID = vFkSpwkf.ID_STORICO ;
+        EXCEPTION
+           WHEN OTHERS THEN
+             PO_ERR_CODICE   := 'KPIGIND003';
+             BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+             RAISE V_ERRORE;
+        END;
+        --
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdSWKF', vFkSwkf.ID_STORICO, i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DataIniSWKF'  , vFkSwkf.DATA_INI  , i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'VersioneSWKF' , vFkSwkf.VERSIONE  , i);
+        --
+        --
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdSPWKF', vFkSpwkf.ID_STORICO, i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DataIniSPWKF'  , vFkSpwkf.DATA_INI  , i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'VersioneSPWKF' , vFkSpwkf.VERSIONE  , i);
+        --
+        -- Valorizzo al data modifica del record da aggiornare
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DatamodificaKIRS' , V_DATA_MODIFICA  , i);
+        --
+        -- Confronto gli stati
+        IF (vFkSpwkf.ID_STORICO     != vOldFkSpwkf.ID_STORICO OR
+           vFkSpwkf.DATA_INI       != vOldFkSpwkf.DATA_INI   OR
+           vFkSpwkf.VERSIONE       != vOldFkSpwkf.VERSIONE
+          ) THEN
+          -- Invoco la inserisci_db
+              --
+              --Popola il campo KPI_IND_REL_STATI.KIRS_NOTE
+              IF P_NOTE IS NOT NULL THEN
+                KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'NoteKIRS' , P_NOTE  , i);
+              END IF;
+              KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DataIniKIRS' , vNow  , i);
+              vPasso := 'A-NUOVADECORRENZA_DB';
+              BASE_SEGNALAZIONI_PCK.TRACE('', V_PROC_NAME, vPasso);
+              KPI_IND_REL_STATI_INF.NUOVADECORRENZA_DB (PO_ERR_SEVERITA  =>  PO_ERR_SEVERITA   ,
+                                                        PO_ERR_CODICE    =>  PO_ERR_CODICE     ,
+                                                        PO_MESSAGGIO     =>  PO_MESSAGGIO      ,
+                                                        P_LINGUAID       =>  P_LINGUAID        ,
+                                                        P_OPEID          =>  P_OPEID           ,
+                                                        P_RUOLOID        =>  P_RUOLOID         ,
+                                                        P_SUPERUSER      =>  P_SUPERUSER       ,
+                                                        PO_EDW_PERMESSI  =>  PO_EDW_PERMESSI   ,
+                                                        P_CONTESTO       =>  P_CONTESTO        ,
+                                                        P_DATAVERSIONE   =>  P_DATAVERSIONE    ,
+                                                        P_DECORRENZA     =>  P_DECORRENZA      ,
+                                                        PO_DML           =>  PO_DML             ,
+                                                        P_DATAMODIFICA   =>  V_DATA_MODIFICA   ,
+                                                        PO_ID            =>  PO_ID,
+                                                        P_VERSIONING     =>  P_VERSIONING      ,
+                                                        P_BATCHMODE      =>  P_BATCHMODE       ,
+                                                        pUsaContesto     =>  pUsaContesto      ,
+                                                        pLinguaIdDes     =>  pLinguaIdDes      ,
+                                                        P_GEST_LINGUA    =>  P_GEST_LINGUA
+                                                       );
+            --END IF;
+            --
+            IF PO_MESSAGGIO IS NOT NULL THEN
+                RAISE V_ERRORE;
+            END IF;
+          --
+        END IF;
+        --
+        vPasso := 'A-PO_ID';
+        -- Valorizzo l'ide del record aggiornato
+        PO_ID := vIdKIRS;
+
+      ELSE
+        vPasso := 'P_COMANDO_STATO NULL';
+        IF PO_DML(i).EXISTS('StoricoIdSPWKF') THEN
+          vFkSpwkf.id_storico := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML, 'StoricoIdSPWKF', i);
+          vFkSwkf.id_storico  := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML, 'StoricoIdSWKF', i);
+        END IF;
+        --
+        IF vFkSpwkf.id_storico IS NOT NULL THEN
+           -- Lo stato iniziale è passato dal chiamante!
+           vFkSwkf := WKFB_STATI_WORKFLOW_INF.GET_FK(vFkSwkf.id_storico );
+           vPasso := 'B-SPWKF';
+           -- Valorizzo il codice dello stato pubblico
+           BEGIN
+              SELECT SPWKF_STATO_PUBBLICO_COD, SPWKF_STATO_PUBBLICO_ID, SPWKF_DATA_INI, SPWKF_VERSIONE
+                INTO PO_STATO_PUBBLICO_COD, PO_STATO_PUBBLICO_ID, vFkSpwkf.DATA_INI, vFkSpwkf.VERSIONE
+                FROM WKFB_STATI_PUBBLICI
+               WHERE SPWKF_STATO_PUBBLICO_ID = vFkSpwkf.id_storico;
+           EXCEPTION
+              WHEN OTHERS THEN
+                PO_ERR_CODICE   := 'KPIGIND003';
+                BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+                RAISE V_ERRORE;
+           END;
+        END IF;
+
+        IF vFkSpwkf.id_storico IS NULL THEN
+           -- Lo stato iniziale è preso dal WKF
+           vPasso := 'B-STATI WKF';
+          /*
+          * GESTIONE CREAZIONE STATI WKF
+          */
+          -- ID/DI/VER TABELLA DOVE SI APPLICA IL WKF
+          V_OGG_STORICO_ID(1) := vFkInd.ID_STORICO;
+          V_OGG_DATA_INI(1)   := vFkInd.DATA_INI  ;
+          V_OGG_VERSIONE(1)   := vFkInd.VERSIONE  ;
+          -- DATA CREAZIONE WKF
+          V_DATA_CREAZIONE(1) := systimestamp;
+          --
+          V_TOG_STORICO_ID(1) := 'KPI_SCIN';
+          V_TOG_DATA_INI(1)   := K_MENO_INFINITO;
+          V_TOG_VERSIONE(1)   := 0;
+          --
+          -- RICAVO TRIPLETTA STORICA TABELLA.
+          V_TAB_STORICO_ID(1) := 'KPI_SCIN';
+          V_TAB_DATA_INI(1)   := K_MENO_INFINITO;
+          V_TAB_VERSIONE(1)   := 0;
+          --
+           vPasso := 'B-CREA_WORKFLOW_LITE_BY_FK';
+          -- RICAVO LO STATO INIZIALE DI WORKFLOW
+          WKF_GESTIONE.CREA_WORKFLOW_LITE_BY_FK ( PO_ERR_SEVERITA       =>  PO_ERR_SEVERITA,
+                                                  PO_ERR_CODICE         =>  PO_ERR_CODICE,
+                                                  PO_MESSAGGIO          =>  PO_MESSAGGIO,
+                                                  P_LINGUAID            =>  P_LINGUAID,
+                                                  P_OPEID               =>  P_OPEID,
+                                                  P_RUOLOID             =>  P_RUOLOID,
+                                                  P_SUPERUSER           =>  P_SUPERUSER,
+                                                  P_EDW_PERMESSI        =>  PO_EDW_PERMESSI,
+                                                  P_CONTESTO            =>  EDW_CONTESTO_API_PCK.SERIALIZZA(P_CONTESTO),
+                                                  P_DATAVERSIONE        =>  P_DATAVERSIONE,
+                                                  P_DECORRENZA          =>  P_DECORRENZA,
+                                                  --
+                                                  PO_ERR_SEVERITA_DETT  =>  VO_ERR_SEVERITA_DETT,
+                                                  PO_ERR_CODICE_DETT    =>  VO_ERR_CODICE_DETT,
+                                                  PO_MESSAGGIO_DETT     =>  VO_MESSAGGIO_DETT,
+                                                  PO_IGNORA_ERRORI      =>  VO_IGNORA_ERRORI,
+                                                  --
+                                                  P_TAB_STORICO_ID      =>  V_TAB_STORICO_ID,
+                                                  P_TAB_DATA_INI        =>  V_TAB_DATA_INI,
+                                                  P_TAB_VERSIONE        =>  V_TAB_VERSIONE,
+                                                  --
+                                                  P_TOG_STORICO_ID      =>  V_TOG_STORICO_ID,
+                                                  P_TOG_DATA_INI        =>  V_TOG_DATA_INI,
+                                                  P_TOG_VERSIONE        =>  V_TOG_VERSIONE,
+                                                  --
+                                                  P_OGG_STORICO_ID      =>  V_OGG_STORICO_ID,
+                                                  P_OGG_DATA_INI        =>  V_OGG_DATA_INI,
+                                                  P_OGG_VERSIONE        =>  V_OGG_VERSIONE,
+                                                  --
+                                                  P_DATA_CREAZIONE      =>  V_DATA_CREAZIONE,
+                                                  --
+                                                  PO_STATO_WORKFLOW_ID  =>  VO_STATO_WORKFLOW_ID,
+                                                  PO_STATO_PUBBLICO_ID  =>  VO_STATO_PUBBLICO_ID
+                                                );
+          -- GESTIONE ERRORI ALL' USCITA DALLA PROCEDURA DI CREAZIONE WKF
+          --DBMS_OUTPUT.PUT_LINE('dopo crea workflow PO_MESSAGGIO = '||PO_MESSAGGIO);
+          IF VO_ERR_SEVERITA_DETT.count > 0
+          THEN
+             PO_ERR_SEVERITA := VO_ERR_SEVERITA_DETT(VO_ERR_SEVERITA_DETT.first);
+             PO_ERR_CODICE   := VO_ERR_CODICE_DETT  (VO_ERR_CODICE_DETT.first);
+             PO_MESSAGGIO    := VO_MESSAGGIO_DETT   (VO_MESSAGGIO_DETT.first);
+             RAISE V_ERRORE;
+          END IF;
+          --
+           vPasso := 'B-vFkSwkf';
+          -- RICAVO TRIPLETTA STORICA STATO WKF
+          PO_STATO_WKF_ID := VO_STATO_WORKFLOW_ID(VO_STATO_WORKFLOW_ID.first);
+          vFkSwkf := WKFB_STATI_WORKFLOW_INF.GET_FK(PO_STATO_WKF_ID);
+          --
+          -- RICAVO TRIPLETTA STORICA STATO PUBBLICO WKF
+           -- Valorizzo il codice dello stato pubblico
+           vPasso := 'B-vFkSpwkf';
+           BEGIN
+              vFkSpwkf.ID_STORICO := VO_STATO_PUBBLICO_ID(VO_STATO_PUBBLICO_ID.first);
+              SELECT SPWKF_STATO_PUBBLICO_COD, SPWKF_STATO_PUBBLICO_ID, SPWKF_DATA_INI, SPWKF_VERSIONE
+                INTO PO_STATO_PUBBLICO_COD, PO_STATO_PUBBLICO_ID, vFkSpwkf.DATA_INI, vFkSpwkf.VERSIONE
+                FROM WKFB_STATI_PUBBLICI
+               WHERE SPWKF_STATO_PUBBLICO_ID = vFkSpwkf.ID_STORICO;
+           EXCEPTION
+              WHEN OTHERS THEN
+                PO_ERR_CODICE   := 'KPIGIND003';
+                BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+                RAISE V_ERRORE;
+           END;
+           --
+        END IF;
+        --
+        vPasso := 'B-ValorizzaQBE';
+        --
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdSWKF', vFkSwkf.ID_STORICO, i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DataIniSWKF'  , vFkSwkf.DATA_INI  , i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'VersioneSWKF' , vFkSwkf.VERSIONE  , i);
+        --
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdSPWKF', vFkSpwkf.ID_STORICO, i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'DataIniSPWKF'  , vFkSpwkf.DATA_INI  , i);
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'VersioneSPWKF' , vFkSpwkf.VERSIONE  , i);
+        --
+        IF (KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML, 'IdKIRS', i) IS NULL) THEN
+          vIdKIRS := KPI_GESTIONE_INDENNIZZI_UTIL.creaguid ('KPI_IND_REL_STATI',  'KIRS_IND_REL_STATO_ID');
+          KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'IdKIRS'       , vIdKIRS, i);
+          KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'StoricoIdKIRS', vIdKIRS, i);
+        END IF;
+        IF P_NOTE IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(PO_DML, 'NoteKIRS' , P_NOTE  , i);
+        END IF;
+        --*****************************************
+        -- Invoco la inserisci_db
+        vPasso := 'B-INSERISCI_DB';
+        KPI_IND_REL_STATI_INF.INSERISCI_DB (
+          PO_ERR_SEVERITA  => PO_ERR_SEVERITA   ,
+          PO_ERR_CODICE    => PO_ERR_CODICE     ,
+          PO_MESSAGGIO     => PO_MESSAGGIO      ,
+          P_LINGUAID       => P_LINGUAID        ,
+          P_OPEID          => P_OPEID           ,
+          P_RUOLOID        => P_RUOLOID         ,
+          P_SUPERUSER      => P_SUPERUSER       ,
+          PO_EDW_PERMESSI  => PO_EDW_PERMESSI   ,
+          P_CONTESTO       => P_CONTESTO        ,
+          P_DATAVERSIONE   => P_DATAVERSIONE    ,
+          P_DECORRENZA     => P_DECORRENZA      ,
+          PO_DML           => PO_DML            ,
+          P_DATAMODIFICA   => V_DATA_MODIFICA   ,
+          PO_ID            => PO_ID             ,
+          P_VERSIONING     => P_VERSIONING      ,
+          P_BATCHMODE      => P_BATCHMODE       ,
+          pUsaContesto     => pUsaContesto      ,
+          pLinguaIdDes     => pLinguaIdDes      ,
+          P_GEST_LINGUA    => P_GEST_LINGUA
+        );
+        IF PO_MESSAGGIO IS NOT NULL THEN
+          RAISE V_ERRORE;
+        END IF;
+        --
+      END IF;
+      --
+      --
+    EXCEPTION
+      WHEN V_ERRORE THEN
+        KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'---> Errore in proc '||V_PROC_NAME ||'('||vPasso||') : '||PO_MESSAGGIO);
+	    WHEN OTHERS THEN
+        BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END INSERISCI_STATI_INDENNIZZI;
+    --
+    PROCEDURE INSERISCI_STATI_INDENNIZZI(
+      PO_ERR_SEVERITA  IN OUT NOCOPY VARCHAR2,
+      PO_ERR_CODICE    IN OUT NOCOPY VARCHAR2,
+      PO_MESSAGGIO     IN OUT NOCOPY VARCHAR2,
+      P_LINGUAID       IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID          IN     VARCHAR2,
+      P_RUOLOID        IN     VARCHAR2,
+      P_SUPERUSER      IN     VARCHAR2,
+      PO_EDW_PERMESSI  IN OUT NOCOPY CLOB,
+      P_CONTESTO       IN     CLOB,
+      P_DATAVERSIONE   IN     TIMESTAMP,
+      P_DECORRENZA     IN     TIMESTAMP,
+      PO_DML           IN OUT NOCOPY CLOB,
+      P_DATAMODIFICA   IN     TIMESTAMP,
+      PO_ID               OUT NOCOPY VARCHAR2,--ID FISICO DELLO STATO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      PO_STATO_PUBBLICO_COD   OUT NOCOPY VARCHAR2,--CODICE STATO PUBBLICO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      PO_STATO_PUBBLICO_ID    OUT NOCOPY VARCHAR2,--ID STATO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      PO_STATO_WKF_ID         OUT NOCOPY VARCHAR2,--ID STATO  WKF IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      P_ID_TOG         IN     VARCHAR2,
+      P_COMANDO_STATO  IN     VARCHAR2,
+      P_DATA_STATO     IN     TIMESTAMP,
+      P_MODULO_ID      IN     KPI_KPI.KPI_KPI_ID%TYPE,
+      P_VERSIONING     IN     EDW_QBE_API_PCK.tBooleano := NULL, --<-- forza il versioning sempre/mai, null a seconda della parametrizzazion
+      P_BATCHMODE      IN     EDW_QBE_API_PCK.tBooleano := 'NO', --<-- In caso di metodo multiset, NO ferma al primo errore, SI elabora tutto
+      pUsaContesto     IN     EDW_QBE_API_PCK.tSiNo := 'SI',  --<-- NULL o SI usa tutte le informazioni del contesto, SEZ usa solo la sezione, NO non usare il contesto
+      pLinguaIdDes     IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE := NULL, --<-- se valorizzato tutte le descrizioni generate dal motore di qbe sono filtrate con questa lingua
+      P_GEST_LINGUA    IN     EDW_QBE_API_PCK.tBooleano := NULL, --<-- SI/NO Gestione della lingua
+      P_IDRICO         IN     VARCHAR2 := 'N',
+      P_NOTE           IN     KPI_IND_REL_STATI.KIRS_NOTE%TYPE := NULL
+    )
+    IS
+        --
+        V_EDW_PERMESSIxml       XMLTYPE;
+        V_CONTESTOxml           XMLTYPE;
+        V_DMLxml                XMLTYPE;
+        V_DML                   Edw_Qbe_Api_Pck.tListaQBE;
+        --
+        V_CONTESTO              EDW_CONTESTO_API_PCK.T_CONTESTO;
+        vTipoSelezione          Edw_Qbe_Api_Pck.tSiNo;
+        vTipoCollegamento       Edw_Qbe_Api_Pck.tCollegamento;
+        v_kMetadato             Edw_Qbe_Api_Pck.tListaTabelle;
+    BEGIN
+      --
+      V_EDW_PERMESSIxml := Edw_Qbe_Api_Pck.CLOB2XMLTYPE( PO_EDW_PERMESSI);
+      V_CONTESTOxml     := Edw_Qbe_Api_Pck.CLOB2XMLTYPE( P_CONTESTO);
+      V_DMLxml          := Edw_Qbe_Api_Pck.CLOB2XMLTYPE( PO_DML);
+      --
+      -- CONVERTO XMLTYPE in T_CONTESTO
+      IF V_CONTESTOxml IS NOT NULL THEN
+        V_CONTESTO := EDW_CONTESTO_API_PCK.deserializza( V_CONTESTOxml);
+      END IF;
+      --
+      Edw_Qbe_Api_Pck.DESERIALIZZA_QBEIN(PO_ERR_SEVERITA, PO_ERR_CODICE,
+                                         PO_MESSAGGIO, P_LINGUAID, P_OPEID, P_RUOLOID, P_SUPERUSER,
+                                         V_EDW_PERMESSIxml, V_CONTESTO, P_DATAVERSIONE, P_DECORRENZA,
+                                         vTipoSelezione, vTipoCollegamento, V_DML, V_DMLxml
+                                         );
+      --
+      INSERISCI_STATI_INDENNIZZI(
+          PO_ERR_SEVERITA       => PO_ERR_SEVERITA
+        , PO_ERR_CODICE         => PO_ERR_CODICE
+        , PO_MESSAGGIO          => PO_MESSAGGIO
+        , P_LINGUAID            => P_LINGUAID
+        , P_OPEID               => P_OPEID
+        , P_RUOLOID             => P_RUOLOID
+        , P_SUPERUSER           => P_SUPERUSER
+        , PO_EDW_PERMESSI       => V_EDW_PERMESSIxml
+        , P_CONTESTO            => V_CONTESTO
+        , P_DATAVERSIONE        => P_DATAVERSIONE
+        , P_DECORRENZA          => P_DECORRENZA
+        , PO_DML                => V_DML
+        , PO_ID                 => PO_ID
+        , PO_STATO_PUBBLICO_COD => PO_STATO_PUBBLICO_COD
+        , PO_STATO_PUBBLICO_ID  => PO_STATO_PUBBLICO_ID
+        , PO_STATO_WKF_ID       => PO_STATO_WKF_ID
+        , P_COMANDO_STATO       => P_COMANDO_STATO
+        , P_MODULO_ID           => P_MODULO_ID
+        , P_VERSIONING          => P_VERSIONING
+        , P_BATCHMODE           => P_BATCHMODE
+        , pUsaContesto          => pUsaContesto
+        , pLinguaIdDes          => pLinguaIdDes
+        , P_GEST_LINGUA         => P_GEST_LINGUA
+        , P_NOTE                => P_NOTE
+      );
+      --
+      Edw_Qbe_Api_Pck.SERIALIZZA_QBEOUT(PO_ERR_SEVERITA, PO_ERR_CODICE,
+                                        PO_MESSAGGIO, P_LINGUAID, P_OPEID, P_RUOLOID, P_SUPERUSER,
+                                        V_EDW_PERMESSIxml, V_CONTESTO, NULL, SYSDATE,
+                                        V_DMLxml, v_kMetadato, V_DML);
+      --
+      PO_DML := Edw_Qbe_Api_Pck.XMLTYPE2CLOB(V_DMLxml);
+      PO_EDW_PERMESSI := EDW_QBE_API_PCK.XMLTYPE2CLOB(V_EDW_PERMESSIxml);
+      --
+    EXCEPTION
+      WHEN OTHERS THEN
+        BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, 'KPI_GESTIONE_INDEN_INS.INSERISCI_STATI_INDENNIZZI', '');
+    END INSERISCI_STATI_INDENNIZZI;
+    --
+
+    --
+    PROCEDURE INSERISCI_REL_SOGG_SCHEDA( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                         PO_ERR_CODICE            IN OUT VARCHAR2,
+                                         PO_MESSAGGIO             IN OUT VARCHAR2,
+                                         P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                         P_OPEID                  IN     VARCHAR2,
+                                         P_RUOLOID                IN     VARCHAR2,
+                                         P_CONTESTO               IN     EDW_CONTESTO_API_PCK.T_CONTESTO,
+                                         P_SCHEDA_PENALTY_ID      IN     VARCHAR2,
+                                         P_SOG_ID_INT             IN     VARCHAR2,
+                                         P_SOG_DATA_INI_INT       IN     TIMESTAMP,
+                                         P_SOG_VERSIONE_INT       IN     NUMBER,
+                                         P_ANAGRAFICA_BASE_ID     IN     VARCHAR2,
+                                         P_ANAGRAFICA_ID          IN     VARCHAR2,
+                                         P_ID_TOG                 IN     VARCHAR2
+                                        )
+    IS
+        V_PROC_NAME               VARCHAR2(100):=K_NOME_PACKAGE||'.INSERISCI_REL_SOGG_SCHEDA ';
+        V_SOGGETTO_R_OGG_ID       VARCHAR2(16);
+        V_SRR_STORICO_ID          VARCHAR2(16);
+        V_R_SOGG_REL_TOG_ID       VARCHAR2(16);
+        V_R_SOGG_REL_TOG_DATA_INI TIMESTAMP;
+        V_R_SOGG_REL_TOG_VERSIONE NUMBER;
+        --
+        V_ERRORE                EXCEPTION;
+        v_rec_sottoscrizioni    edw_qbe_api_pck.trecordsottoscrizioni;
+        v_ang_anagrafe_base_id  anab_ruoli_soggetto.ang_anagrafe_base_id%type;
+        V_AND_ANAGRAFE_ID       anab_ruoli_soggetto.ang_anagrafe_base_id%type;
+    BEGIN
+        -- Recupero i valori delle sottoscrizioni dal contesto
+        v_rec_sottoscrizioni := edw_qbe_api_pck.getrecordsottoscrizioni(
+                                                        po_err_severita => po_err_severita,
+                                                        po_err_codice   => po_err_codice,
+                                                        po_messaggio    => po_messaggio,
+                                                        p_linguaid      => p_linguaid,
+                                                        p_contesto      => P_CONTESTO,
+                                                        p_sezione_id    => null
+                                                        );
+
+        if (PO_MESSAGGIO is null) then
+           v_ang_anagrafe_base_id := v_rec_sottoscrizioni('ANG_ANAGRAFE_BASE_ID').valoreid;
+           V_AND_ANAGRAFE_ID := V_REC_SOTTOSCRIZIONI('AND_ANAGRAFE_ID').VALOREID;
+        end if;
+        V_SOGGETTO_R_OGG_ID       := KPI_GESTIONE_INDENNIZZI_UTIL.CREAGUID( 'ANA_SOGGETTI_REL_OGG','SRR_SOGGETTO_OGG_ID' );
+        V_SRR_STORICO_ID          := V_SOGGETTO_R_OGG_ID;
+       BEGIN
+            SELECT ARSRT.RSO_STORICO_ID
+                   ,ARSRT.TOG_DATA_INI
+                   ,ARSRT.RSO_VERSIONE
+            INTO  V_R_SOGG_REL_TOG_ID
+                  ,V_R_SOGG_REL_TOG_DATA_INI
+                  ,V_R_SOGG_REL_TOG_VERSIONE
+            FROM  ANAB_RUOLI_SOGGETTO ARS,
+                  ANAB_RUOLI_SOGG_REL_TOG ARSRT
+            WHERE ARS.ANG_ANAGRAFE_BASE_ID = v_ang_anagrafe_base_id --dp 27/06/2011 adeguamento multisezione
+              AND ARS.RSOG_RUOLO_SOGGETTO_COD  = 'INT'
+              AND ARS.RSOG_DATA_VER_FIN = EDW_UTILITA.GET_DATA_SUP
+              AND ARS.RSOG_FLAG_ANN = K_N
+              AND ARSRT.RSOG_RUOLO_SOGGETTO_ID = ARS.RSOG_RUOLO_SOGGETTO_ID
+              AND ARSRT.RSOG_DATA_INI = ARS.RSOG_DATA_INI
+              AND ARSRT.RSO_FLAG_ANN  = K_N
+              AND ARSRT.TOG_TIPO_OGGETTO_ID = P_ID_TOG
+              AND ARSRT.RSO_DATA_VER_FIN = EDW_UTILITA.GET_DATA_SUP
+              ;
+       EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            dbms_output.put_line('RELAZIONE TRA ROULO SOGGETTO E TIPO OGGETTO INESISTENTE. VERIFICARE LA PARAMETRIZZAZIONE');
+            PO_MESSAGGIO := EDW_LOGGER_PCK.DECODE_COD('KPIGIND019', FALSE, P_LINGUAID);
+            RAISE V_ERRORE;
+       END;
+
+
+        --dbms_output.put_line('INSERISCI_REL_SOGG_SCHEDA P_ID_TOG '||P_ID_TOG);
+        --dbms_output.put_line('INSERISCI_REL_SOGG_SCHEDA V_R_SOGG_REL_TOG_ID '||V_R_SOGG_REL_TOG_ID );
+        INSERT INTO ANA_SOGGETTI_REL_OGG  SRR
+                    (SRR_SOGGETTO_OGG_ID
+                     ,ANG_ANAGRAFE_BASE_ID
+                     ,SOG_SOGGETTO_ID
+                     ,AND_ANAGRAFE_ID
+                     ,OGG_OGGETTO_ID
+                     ,OGG_DATA_INI
+                     ,OGG_VERSIONE
+                     ,RSO_RUOLO_SOG_REL_TOG_ID
+                     ,TOG_TIPO_OGGETTO_ID
+                     ,RSO_DATA_INI
+                     ,RSO_VERSIONE
+                     ,SOG_DATA_INI
+                     ,SOG_VERSIONE
+                     ,SRR_STORICO_ID
+                     ,SRR_DATA_INI
+                     ,SRR_VERSIONE
+                     ,SRR_DATA_FIN
+                     ,SRR_DATA_LIM
+                     ,SRR_DATA_VER_INI
+                     ,SRR_DATA_VER_FIN
+                     ,SRR_FLAG_ANN
+                     ,QUS_DATA_INI
+                     ,QUS_QUALIFICA_SOGG_ID
+                     ,QUS_VERSIONE  )
+            VALUES
+                    (V_SOGGETTO_R_OGG_ID
+                     ,NVL(P_ANAGRAFICA_BASE_ID, v_ang_anagrafe_base_id)
+                     ,P_SOG_ID_INT
+                     ,NVL(P_ANAGRAFICA_ID, V_AND_ANAGRAFE_ID)
+                     ,P_SCHEDA_PENALTY_ID
+                     ,K_MENO_INFINITO
+                     ,0
+                     ,V_R_SOGG_REL_TOG_ID
+                     ,P_ID_TOG
+                     ,V_R_SOGG_REL_TOG_DATA_INI
+                     ,V_R_SOGG_REL_TOG_VERSIONE
+                     ,P_SOG_DATA_INI_INT
+                     ,P_SOG_VERSIONE_INT
+                     ,V_SRR_STORICO_ID
+                     ,K_MENO_INFINITO
+                     ,0
+                     ,K_PIU_INFINITO
+                     ,K_MENO_INFINITO
+                     ,K_MENO_INFINITO
+                     ,K_PIU_INFINITO
+                     ,K_N
+                     ,NULL
+                     ,NULL
+                     ,NULL
+                    );
+
+    EXCEPTION
+        WHEN V_ERRORE THEN
+            PO_ERR_SEVERITA := 'F';
+            PO_ERR_CODICE   := 'IND000';
+            PO_MESSAGGIO    := 'Proc '|| V_PROC_NAME || PO_MESSAGGIO;
+        WHEN OTHERS THEN
+            PO_ERR_SEVERITA := 'F';
+            PO_ERR_CODICE   := SQLCODE;
+            PO_MESSAGGIO    := 'Proc '|| V_PROC_NAME ||EDW_LOGGER_PCK.DECODE_COD(PO_ERR_CODICE, TRUE, P_LINGUAID);
+
+    END INSERISCI_REL_SOGG_SCHEDA;
+    --
+    PROCEDURE INSERISCI_REL_SOGG_SCHEDA( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                         PO_ERR_CODICE            IN OUT VARCHAR2,
+                                         PO_MESSAGGIO             IN OUT VARCHAR2,
+                                         P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                         P_OPEID                  IN     VARCHAR2,
+                                         P_RUOLOID                IN     VARCHAR2,
+                                         P_CONTESTO               IN     CLOB,
+                                         P_SCHEDA_PENALTY_ID      IN     VARCHAR2,
+                                         P_SOG_ID_INT             IN     VARCHAR2,
+                                         P_SOG_DATA_INI_INT       IN     TIMESTAMP,
+                                         P_SOG_VERSIONE_INT       IN     NUMBER,
+                                         P_ANAGRAFICA_BASE_ID     IN     VARCHAR2,
+                                         P_ANAGRAFICA_ID          IN     VARCHAR2,
+                                         P_ID_TOG                 IN     VARCHAR2
+                                        )
+    IS
+        V_PROC_NAME               VARCHAR2(100):=K_NOME_PACKAGE||'.INSERISCI_REL_SOGG_SCHEDA ';
+        v_contesto              edw_contesto_api_pck.t_contesto;
+    BEGIN
+        -- Recupero i valori delle sottoscrizioni dal contesto
+        v_contesto := edw_contesto_api_pck.deserializza(edw_qbe_api_pck.clob2xmltype(p_contesto));
+        INSERISCI_REL_SOGG_SCHEDA(
+            PO_ERR_SEVERITA      => PO_ERR_SEVERITA
+          , PO_ERR_CODICE        => PO_ERR_CODICE
+          , PO_MESSAGGIO         => PO_MESSAGGIO
+          , P_LINGUAID           => P_LINGUAID
+          , P_OPEID              => P_OPEID
+          , P_RUOLOID            => P_RUOLOID
+          , P_CONTESTO           => v_contesto
+          , P_SCHEDA_PENALTY_ID  => P_SCHEDA_PENALTY_ID
+          , P_SOG_ID_INT         => P_SOG_ID_INT
+          , P_SOG_DATA_INI_INT   => P_SOG_DATA_INI_INT
+          , P_SOG_VERSIONE_INT   => P_SOG_VERSIONE_INT
+          , P_ANAGRAFICA_BASE_ID => P_ANAGRAFICA_BASE_ID
+          , P_ANAGRAFICA_ID      => P_ANAGRAFICA_ID
+          , P_ID_TOG             => P_ID_TOG
+        );
+        --
+        --
+    EXCEPTION
+        WHEN OTHERS THEN
+            PO_ERR_SEVERITA := 'F';
+            PO_ERR_CODICE   := SQLCODE;
+            PO_MESSAGGIO    := 'Proc '|| V_PROC_NAME ||EDW_LOGGER_PCK.DECODE_COD(PO_ERR_CODICE, TRUE, P_LINGUAID);
+
+    END INSERISCI_REL_SOGG_SCHEDA;
+    --
+    --
+    PROCEDURE UPDATE_SCHEDA_SCIN_DB(
+      PO_ERR_SEVERITA            IN OUT NOCOPY VARCHAR2,
+      PO_ERR_CODICE              IN OUT   VARCHAR2,
+      PO_MESSAGGIO               IN OUT   VARCHAR2,
+      P_LINGUAID                 IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                    IN       VARCHAR2,
+      P_RUOLOID                  IN       VARCHAR2,
+      P_SUPERUSER                IN       VARCHAR2,
+      PO_EDW_PERMESSI            IN OUT NOCOPY XMLTYPE,
+      P_CONTESTO                 IN       EDW_CONTESTO_API_PCK.T_CONTESTO,
+      --
+      P_DATAMODIFICA             IN       TIMESTAMP,
+      P_COMANDO_STATO            IN       VARCHAR2,
+      P_MODULO_ID                IN       VARCHAR2,
+      PO_DML_KIRS                IN OUT NOCOPY EDW_QBE_API_PCK.TLISTAQBE,
+      PO_DML_SCIN                IN OUT NOCOPY EDW_QBE_API_PCK.TLISTAQBE,
+      PO_STATO_PUBBLICO_COD         OUT NOCOPY VARCHAR2,--CODICE STATO PUBBLICO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      PO_STATO_PUBBLICO_ID          OUT NOCOPY VARCHAR2,--ID STATO IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      PO_STATO_WKF_ID               OUT NOCOPY VARCHAR2 --ID STATO  WKF IN CUI ARRIVA LA SCHEDA INDENNIZZO
+      )
+    IS
+      --
+      V_PROC_NAME             VARCHAR2(100):=K_NOME_PACKAGE||'.UPDATE_SCHEDA_SCIN_DB';
+      I                       NUMBER := 1;
+      V_FK_KIRS               EDW_QBE_API_PCK.tPk;
+      vPasso                  VARCHAR2(100);
+      vNota                   KPI_SCHEDE_PENALTY.SCIN_NOTA_STATO%TYPE;
+      vNotaOut                KPI_SCHEDE_PENALTY.SCIN_NOTA_STATO%TYPE;
+      vIdKIRS                 KPI_SCHEDE_PENALTY.KIRS_IND_REL_STATO_ID%TYPE;
+      vIdSCIN                 KPI_SCHEDE_PENALTY.SCIN_SCHEDA_PENALTY_ID%TYPE;
+      --
+    BEGIN
+        --
+        vPasso := 'INIT';
+        --
+        I := PO_DML_SCIN.FIRST;
+        --
+        IF P_COMANDO_STATO IS NOT NULL THEN
+          --
+          vNota := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'NotaStatoSCIN', I);
+          -- FASE di PRE-UPDATE
+          DECLARE
+            --
+            vFornPk                 EDW_QBE_API_PCK.tPk;
+            vDataMassimaSCIN        KPI_SCHEDE_PENALTY.SCIN_DATA_MASSIMA%TYPE;
+            vDataFineSCIN           KPI_SCHEDE_PENALTY.SCIN_DATA_FINE%TYPE;
+            vTipoPenaltySCIN        KPI_SCHEDE_PENALTY.SCIN_TIPO_PENALTY%TYPE;
+            vScadenzaPagamentoSCIN  KPI_SCHEDE_PENALTY.SCIN_DATA_SCADENZA_PAGAMENTO%TYPE;
+            vIdKDKPI                KPI_SCHEDE_PENALTY.KDKPI_DEFINIZIONE_KPI_ID%TYPE;
+            vCodKDKPI               KPIB_DEFINIZIONI_KPI.KDKPI_DEFINIZIONE_KPI_COD%TYPE;
+            vImportoIndennizzoSCIN  KPI_SCHEDE_PENALTY.SCIN_IMPORTO_INDENNIZZO%TYPE;
+            vImportoMaggioratoSCIN  KPI_SCHEDE_PENALTY.SCIN_IMPORTO_MAGGIORATO%TYPE;
+            vLeggiKirs              BOOLEAN := FALSE;
+            --
+          BEGIN
+            --
+            vPasso := 'vIdSCIN';
+            vIdSCIN                 := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'IdSCIN', I);
+            --
+            IF vIdSCIN IS NULL THEN
+              PO_ERR_CODICE := 'CONF000007';--IL PARAMETRO <NOMEPARAMETRO> E' OBBLIGATORIO
+              BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME , '', 'NOMEPARAMETRO', 'IdSCIN');
+              RETURN;
+            END IF;
+            --
+            vPasso := 'GET_VALORI';
+            vFornPk.Id_Storico      := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'IdForn', I);
+            vFornPk.Data_Ini        := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'DataIniForn', I);
+            vFornPk.Versione        := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'VersioneForn', I);
+            --vDataMassimaSCIN        := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE_DATA(PO_DML_SCIN, 'DataMassimaSCIN', I);
+            vDataFineSCIN           := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE_DATA(PO_DML_SCIN, 'DataFineSCIN', I);
+            vTipoPenaltySCIN        := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'TipoPenaltySCIN', I);
+            vScadenzaPagamentoSCIN  := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE_DATA(PO_DML_SCIN, 'DataScadenzaPagamentoSCIN', I);
+            vIdKDKPI                := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'IdKDKPI', I);
+            vImportoIndennizzoSCIN  := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'ImportoIndennizzoSCIN', I);
+            --
+            IF  PO_DML_KIRS.COUNT  = 0 THEN
+              vLeggiKirs := true;
+              --
+              vIdKIRS                 := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'StoricoIdKIRS', I);
+              IF  vIdKIRS IS NULL THEN
+                vIdKIRS                 := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'IdKIRSFKIRS', I);
+              END IF;
+              IF  vIdKIRS IS NULL THEN
+                vIdKIRS                 := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(PO_DML_SCIN, 'StoricoIdKIRSFKIRS', I);
+              END IF;
+              --
+              IF  vIdKIRS IS NULL THEN
+                vLeggiKirs := true;
+              END IF;
+              --
+            END IF;
+            --
+            IF vFornPk.Id_Storico IS NULL OR   --vDataMassimaSCIN  IS NULL OR
+              vDataFineSCIN  IS NULL OR vTipoPenaltySCIN  IS NULL OR
+              vScadenzaPagamentoSCIN  IS NULL OR vImportoIndennizzoSCIN IS NULL OR
+              vLeggiKirs THEN
+              -- Se sono nulli allora il valore è quello che c'è sulla tabella
+              --
+              vPasso := 'SEL SCIN';
+              SELECT
+                  NVL(vFornPk.Id_Storico    , SCIN.FORN_FORNITURA_ID)
+                , NVL(vFornPk.Data_Ini      , SCIN.FORN_DATA_INI)
+                , NVL(vFornPk.versione      , SCIN.FORN_VERSIONE)
+                --, TRUNC(NVL(vDataMassimaSCIN, SCIN.SCIN_DATA_MASSIMA))
+                , TRUNC(NVL(vDataFineSCIN   , SCIN.SCIN_DATA_FINE))
+                , NVL(vTipoPenaltySCIN      , SCIN.SCIN_TIPO_PENALTY)
+                , NVL(vScadenzaPagamentoSCIN, SCIN.SCIN_DATA_SCADENZA_PAGAMENTO)
+                , NVL(vIdKDKPI              , SCIN.KDKPI_DEFINIZIONE_KPI_ID)
+                , NVL(vIdKIRS               , SCIN.KIRS_IND_REL_STATO_ID)
+                , NVL(vImportoIndennizzoSCIN, SCIN.SCIN_IMPORTO_INDENNIZZO)
+                , NVL(vImportoMaggioratoSCIN, SCIN.SCIN_IMPORTO_MAGGIORATO)
+              INTO
+                  vFornPk.Id_Storico
+                , vFornPk.Data_Ini
+                , vFornPk.versione
+                --, vDataMassimaSCIN
+                , vDataFineSCIN
+                , vTipoPenaltySCIN
+                , vScadenzaPagamentoSCIN
+                , vIdKDKPI
+                , vIdKIRS
+                , vImportoIndennizzoSCIN
+                , vImportoMaggioratoSCIN
+              FROM KPI_SCHEDE_PENALTY SCIN
+              WHERE SCIN.SCIN_SCHEDA_PENALTY_ID  = vIdSCIN;
+              --
+            END IF;
+            --
+            IF P_COMANDO_STATO IN ('ONRICALCOLA','ONVALIDA','ONSOSPESOVALIDA') -- Se sto entrando nello stato validato
+              AND vScadenzaPagamentoSCIN < sysdate -- e la data pagamento è stata superata
+              AND vImportoMaggioratoSCIN = 'N' -- e la scheda è maggiorabile (N = maggiorabile, S già maggiorata, NULL non maggioarabile)
+              THEN
+              --
+              --Indennizzo maggiorato per superamento del tempo massimo di corresponsione
+              KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_SCIN, 'ImportoIndennizzoSCIN', vImportoIndennizzoSCIN * 3 , I);
+              KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_SCIN, 'ImportoMaggioratoSCIN', 'S', I);
+              vNota := vNota ||' '||EDW_LOGGER_PCK.DECODE_COD('KPIIND048', FALSE, P_LINGUAID);
+              --
+            END IF;
+            --
+            --
+            vPasso := '258_15';
+            IF vTipoPenaltySCIN = 'ESEC_MOROSITA' THEN
+              vPasso := 'SEL KDKPI';
+              SELECT KDKPI_DEFINIZIONE_KPI_COD
+              INTO vCodKDKPI
+              FROM KPIB_DEFINIZIONI_KPI KDKPI
+              WHERE  KDKPI.KDKPI_DEFINIZIONE_KPI_ID  = vIdKDKPI;
+              --
+              IF vCodKDKPI IN ( 'S28', 'S29', 'S30') THEN
+                --
+                SELECT  TRUNC(KCK.KCK_DATA_SCADENZA_PROC) + 1
+                INTO vDataMassimaSCIN
+                FROM KPI_CRONOLOGIA_KPI KCK
+                  , KPI_SCHEDE_PENALTY SCIN
+                WHERE SCIN.SCIN_SCHEDA_PENALTY_ID  = vIdSCIN
+                  AND KCK.KCK_CRONOLOGIA_KPI_ID  = SCIN.KCK_CRONOLOGIA_KPI_ID;
+                --
+                vDataFineSCIN := vDataFineSCIN + 1;
+                vDataFineSCIN := vDataFineSCIN - EDW_QBE_API_PCK.getkDeltaTime; -- Non farle insieme altrimenti diventa una Date
+                --
+                IF P_COMANDO_STATO IN(
+                      KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLA        --CALCOLATO          ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLADOCNF1  --INFATTURAZIONE     ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLA1       --VALIDATO           ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLA2       --SOSPESO            ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLA3       --ERROREFATTURAZIONE ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONDOCANNULLATO   --FATTURATO          ->ANNULLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONCALCOLA        --VALIDATO           ->CALCOLATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONDARICALCOLARE  --VALIDATO           ->DARICALCOLARE
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONANNULLADOCNF   --DOCDAANNULLARE     ->DARICALCOLARE
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONVALIDASOSPENDI --VALIDATO           ->SOSPESO
+                  ) THEN
+                  -- Si rimuove l'opzione in tutti gli archi che portano in ANNULLATO, CALCOLATO, SOSPESO o DARICALCOLARE
+                  -- (fa eccezione il ramo sospeso calcolato perchè in quegli stati l'opzione già non c'è)
+                  --
+                  vPasso := 'RIMUOVI_OPZIONE_258_15';
+                  --
+                  KPI_GESTIONE_IND_258_15_PCK.RIMUOVI_OPZIONE_258_15(
+                    PO_ERR_SEVERITA => PO_ERR_SEVERITA,
+                    PO_ERR_CODICE => PO_ERR_CODICE,
+                    PO_MESSAGGIO => PO_MESSAGGIO,
+                    P_LINGUAID => P_LINGUAID,
+                    P_OPEID => P_OPEID,
+                    P_RUOLOID => P_RUOLOID,
+                    P_SUPERUSER => P_SUPERUSER,
+                    PO_EDW_PERMESSI => PO_EDW_PERMESSI,
+                    P_CONTESTO => P_CONTESTO,
+                    P_FORN_PK => vFornPk,
+                    P_DATA_INI => vDataMassimaSCIN,
+                    P_DATA_FIN => vDataFineSCIN,
+                    P_KPI_ID => P_MODULO_ID,
+                    PO_NOTA => vNotaOut
+                  );
+                  --
+                  IF PO_MESSAGGIO IS NOT NULL THEN RETURN; END IF;
+                  --
+                ELSIF P_COMANDO_STATO IN(
+                      KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONRICALCOLA      -- DARICALCOLARE  ->VALIDATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONSOSPESOVALIDA  -- SOSPESO        ->VALIDATO
+                    , KPI_GESTIONE_INDENNIZZI_UTIL.K_COMANDO_SCIN_ONVALIDA         -- CALCOLATO      ->VALIDATO
+                  ) THEN
+                  -- Si aggiunge l'opzione in tutti gli archi che portano in VALIDATO
+                  --
+                  vPasso := 'AGGIUNGI_OPZIONE_258_15';
+                  KPI_GESTIONE_IND_258_15_PCK.AGGIUNGI_OPZIONE_258_15(
+                    PO_ERR_SEVERITA => PO_ERR_SEVERITA,
+                    PO_ERR_CODICE => PO_ERR_CODICE,
+                    PO_MESSAGGIO => PO_MESSAGGIO,
+                    P_LINGUAID => P_LINGUAID,
+                    P_OPEID => P_OPEID,
+                    P_RUOLOID => P_RUOLOID,
+                    P_SUPERUSER => P_SUPERUSER,
+                    PO_EDW_PERMESSI => PO_EDW_PERMESSI,
+                    P_CONTESTO => P_CONTESTO,
+                    P_FORN_ID => vFornPk.ID_STORICO,
+                    P_DATA_INI => vDataMassimaSCIN,
+                    P_DATA_FIN => vDataFineSCIN,
+                    P_KPI_ID => P_MODULO_ID,
+                    PO_NOTA => vNotaOut
+                  );
+                  --
+                  IF PO_MESSAGGIO IS NOT NULL THEN RETURN; END IF;
+                  --
+                END IF;
+                --
+                IF vNotaOut IS NOT NULL THEN
+                  --
+                  vNota := vNota ||vNotaOut;
+                  --
+                  --
+                END IF;
+              END IF;
+            END IF;
+          END;
+          --
+          IF  PO_DML_KIRS.COUNT  = 0 THEN
+            KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_KIRS, 'IdKIRS', vIdKirs , I);
+          END IF;
+          --           
+          if P_COMANDO_STATO = 'ONANNCALCOLATO' then 
+             --  
+             declare
+                v_stato_precedente   KPI_IND_REL_STATI.SPWKF_STATO_PUBBLICO_ID%type; 
+             begin  
+                -- 
+                SELECT * 
+                  INTO V_STATO_PRECEDENTE
+                  FROM ( 
+                         SELECT T.SPWKF_STATO_PUBBLICO_ID
+                           FROM KPI_IND_REL_STATI T
+                          WHERE KIRS_STORICO_ID = VIDKIRS
+                            AND KIRS_FLAG_ANN = 'N'
+                            AND KIRS_DATA_VER_FIN = EDW_UTILITA.GET_DATA_SUP
+                            AND T.KIRS_DATA_FIN <> EDW_UTILITA.GET_DATA_SUP
+                          ORDER BY T.KIRS_DATA_FIN DESC
+                        )
+                 WHERE ROWNUM = 1;  
+                 --  
+                 if v_stato_precedente = 'CALCOLATO' or
+                    v_stato_precedente = 'VALIDATO' or
+                    v_stato_precedente = 'SOSPESO' then 
+                    --
+                    PO_ERR_SEVERITA := 'B';     
+                    PO_ERR_CODICE := 'KPIIND052'; -- Transizione non ammessa perché lo stato precedente all’annullamento non è: CALCOLATO, VALIDATO o SOSPESO
+                    PO_MESSAGGIO := EDW_LOGGER_PCK.DECODE_COD(PO_ERR_CODICE, FALSE, P_LINGUAID); 
+                    BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, '');
+                    BASE_SEGNALAZIONI_PCK.TRACE('', V_PROC_NAME, PO_MESSAGGIO, vPasso);
+                    RETURN;
+                    --
+                 end if;
+                 --
+             end;  
+             --
+          end if;
+          --INVOCO LA INSERISCI STATO INDENNIZZI PER EFFETTUARE L'AGGIORNAMENTO DELLA TABELLA DI RELAZIONE KPI_IND_REL_STATI
+          vPasso := 'INSERISCI_STATI_INDENNIZZI';
+          INSERISCI_STATI_INDENNIZZI(
+              PO_ERR_SEVERITA       => PO_ERR_SEVERITA
+            , PO_ERR_CODICE         => PO_ERR_CODICE
+            , PO_MESSAGGIO          => PO_MESSAGGIO
+            , P_LINGUAID            => P_LINGUAID
+            , P_OPEID               => P_OPEID
+            , P_RUOLOID             => P_RUOLOID
+            , P_SUPERUSER           => P_SUPERUSER
+            , PO_EDW_PERMESSI       => PO_EDW_PERMESSI
+            , P_CONTESTO            => P_CONTESTO
+            , P_DATAVERSIONE        => NULL
+            , P_DECORRENZA          => NULL
+            , PO_DML                => PO_DML_KIRS
+            , PO_ID                 => vIdKirs
+            , PO_STATO_PUBBLICO_COD => PO_STATO_PUBBLICO_COD
+            , PO_STATO_PUBBLICO_ID  => PO_STATO_PUBBLICO_ID
+            , PO_STATO_WKF_ID       => PO_STATO_WKF_ID
+            , P_COMANDO_STATO       => P_COMANDO_STATO
+            , P_MODULO_ID           => P_MODULO_ID
+            , P_NOTE                => vNota
+          );
+          --
+          IF PO_MESSAGGIO IS NOT NULL THEN
+            BASE_SEGNALAZIONI_PCK.TRACE('', V_PROC_NAME, PO_MESSAGGIO, vPasso);
+            RETURN;
+          END IF;
+          --
+          --
+          vPasso := 'StoricoIdKIRS';
+          --AGGIORNO LA KPI_SCHEDA_PENALTY CON IL NUOVO STATO
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_SCIN, 'IdKIRS', vIdKirs , I);
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_SCIN, 'StatoSCIN', PO_STATO_PUBBLICO_COD  , I);
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(PO_DML_SCIN, 'NotaStatoSCIN', vNota , I);
+          --
+        END IF;
+        --
+        --
+        vPasso := 'AGGIORNA_DB';
+        KPI_SCHEDE_PENALTY_INF.AGGIORNA_DB(
+          PO_ERR_SEVERITA  =>  PO_ERR_SEVERITA,
+          PO_ERR_CODICE    =>  PO_ERR_CODICE,
+          PO_MESSAGGIO     =>  PO_MESSAGGIO,
+          P_LINGUAID       =>  P_LINGUAID,
+          P_OPEID          =>  P_OPEID,
+          P_RUOLOID        =>  P_RUOLOID,
+          P_SUPERUSER      =>  P_SUPERUSER,
+          PO_EDW_PERMESSI  =>  PO_EDW_PERMESSI,
+          P_CONTESTO       =>  P_CONTESTO,
+          P_DATAVERSIONE   =>  NULL,
+          P_DECORRENZA     =>  NULL,
+          PO_DML           =>  PO_DML_SCIN,
+          P_DATAMODIFICA   =>  P_DATAMODIFICA
+          );
+        --
+        IF PO_MESSAGGIO IS NOT NULL THEN
+          BASE_SEGNALAZIONI_PCK.TRACE('', V_PROC_NAME, PO_MESSAGGIO, vPasso);
+          RETURN;
+        END IF;
+         --
+    EXCEPTION
+        WHEN OTHERS THEN
+          BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END UPDATE_SCHEDA_SCIN_DB;
+    --
+    --
+    --
+    PROCEDURE AGGIORNA_STATO_SCHEDE_CL( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                       PO_ERR_CODICE            IN OUT VARCHAR2,
+                                       PO_MESSAGGIO             IN OUT VARCHAR2,
+                                       P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                       P_OPEID                  IN     VARCHAR2,
+                                       P_RUOLOID                IN     VARCHAR2,
+                                       P_CONTESTO               IN     CLOB,
+                                       P_STATO_PUBBLICO         IN     VARCHAR2,
+                                       P_ID_KIRS                IN     VARCHAR2,
+                                       P_DATA_INI_KIRS          IN     TIMESTAMP,
+                                       P_VERSIONE_KIRS          IN     NUMBER,
+                                       P_NOTA_STATO             IN     VARCHAR2,
+                                       P_SCHEDA_PENALTY_ID      IN     VARCHAR2,
+                                       P_MOROSITA_SOG           IN     VARCHAR DEFAULT NULL,
+                                       P_SCHEDA_DOPPIA          IN     VARCHAR DEFAULT NULL,
+                                       P_CTSOS_TIPCAU_SOSP_ID   IN     VARCHAR DEFAULT NULL
+                                    )
+    IS
+        V_PROC_NAME             VARCHAR2(100):=K_NOME_PACKAGE||'.AGGIORNA_STATO_SCHEDE';
+        V_SUPERUSER             VARCHAR2(50);
+        V_EDW_PERMESSI_XML      XMLTYPE;
+        V_EDW_PERMESSI          CLOB;
+        V_CONTESTO_XML          XMLTYPE;
+        V_T_CONTESTO            EDW_CONTESTO_API_PCK.T_CONTESTO;
+        I                       NUMBER;
+        V_DATA_MODIFICA         TIMESTAMP;
+        V_DML_SCIN              EDW_QBE_API_PCK.TLISTAQBE;
+        V_DML_KIRS              EDW_QBE_API_PCK.TLISTAQBE;
+        --
+        V_COMANDO_STATO         VARCHAR2(100);
+        vStatoOri               VARCHAR2(100);
+        V_KPI_ID                VARCHAR2(100);
+        V_STATO_PUBBLICO_COD    VARCHAR2(100);
+        V_STATO_PUBBLICO_ID     VARCHAR2(100);
+        V_STATO_WKF_ID          VARCHAR2(100);
+        --
+        V_ERRORE                EXCEPTION;
+        vPasso                  VARCHAR2(100);
+    BEGIN
+      --
+        V_CONTESTO_XML     := EDW_QBE_API_PCK.CLOB2XMLTYPE(P_CONTESTO);
+        -- CONVERTO XMLTYPE IN T_CONTESTO
+        IF V_CONTESTO_XML IS NOT NULL THEN
+          V_T_CONTESTO := EDW_CONTESTO_API_PCK.deserializza( V_CONTESTO_XML);
+        END IF;
+        --  ricavo la data modifica del KP
+        vPasso := 'SEL_SCIN';
+        begin
+            SELECT KPEN.SCIN_DATAMODIFICA, SCIN_STATO, KPI_KPI_ID
+            INTO V_DATA_MODIFICA, vStatoOri, V_KPI_ID
+            FROM KPI_SCHEDE_PENALTY KPEN
+            WHERE KPEN.SCIN_SCHEDA_PENALTY_ID = P_SCHEDA_PENALTY_ID
+              AND KPEN.SCIN_FLAG_ANN          = K_N
+              AND KPEN.SCIN_DATA_VER_FIN      = EDW_UTILITA.GET_DATA_SUP;
+        EXCEPTION
+          WHEN OTHERS THEN
+            BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+            RAISE V_ERRORE;
+        END;
+        --
+      -- Ricavo il comando per evolvere la scheda
+      vPasso := 'RICAVA_COMANDO';
+      KPI_GESTIONE_INDENNIZZI_UTIL.RICAVA_COMANDO(
+          PO_ERR_SEVERITA
+        , PO_ERR_CODICE
+        , PO_MESSAGGIO
+        , P_LINGUAID
+        , P_OPEID
+        , P_RUOLOID
+        , ''
+        , V_EDW_PERMESSI
+        , P_CONTESTO
+        , vStatoOri
+        , P_STATO_PUBBLICO
+        , V_COMANDO_STATO
+      );
+      IF PO_MESSAGGIO IS NOT NULL THEN
+         RAISE V_ERRORE;
+      END IF;
+      --
+      vPasso := 'V_DML_KIRS';
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(V_DML_KIRS, 'StoricoIdKIRS', P_ID_KIRS, 1);
+        --
+      vPasso := 'V_DML_SCIN';
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'IdSCIN', P_SCHEDA_PENALTY_ID, I);
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'DatamodificaSCIN', V_DATA_MODIFICA, I);
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'StoricoIdKIRS', P_ID_KIRS, I);
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'NotaStatoSCIN',P_NOTA_STATO, I);
+        --
+        --AGGIUNGO AL V_DML_SCIN il flag che indica se il soggetto e' moroso e il flag che indica se si tratta
+        --di una scheda duplicata per lo stesso soggetto e nello stesso anno solare.
+        IF P_MOROSITA_SOG IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'MorositaSogSCIN',P_MOROSITA_SOG , I);
+        END IF;
+        IF P_SCHEDA_DOPPIA IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'SchedaDoppiaSCIN',P_SCHEDA_DOPPIA, I);
+        END IF;
+        IF P_SCHEDA_DOPPIA IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'StoricoIdCTSOS',P_CTSOS_TIPCAU_SOSP_ID, I);
+        END IF;
+        --
+      vPasso := 'UPDATE_SCHEDA_SCIN_DB';
+      UPDATE_SCHEDA_SCIN_DB(
+          PO_ERR_SEVERITA       => PO_ERR_SEVERITA
+        , PO_ERR_CODICE         => PO_ERR_CODICE
+        , PO_MESSAGGIO          => PO_MESSAGGIO
+        , P_LINGUAID            => P_LINGUAID
+        , P_OPEID               => P_OPEID
+        , P_RUOLOID             => P_RUOLOID
+        , P_SUPERUSER           => ''
+        , PO_EDW_PERMESSI       => V_EDW_PERMESSI_XML
+        , P_CONTESTO            => V_T_CONTESTO
+        , P_DATAMODIFICA        => NULL
+        , P_COMANDO_STATO       => V_COMANDO_STATO
+        , P_MODULO_ID           => V_KPI_ID
+        , PO_DML_KIRS           => V_DML_KIRS
+        , PO_DML_SCIN           => V_DML_SCIN
+        , PO_STATO_PUBBLICO_COD => V_STATO_PUBBLICO_COD
+        , PO_STATO_PUBBLICO_ID  => V_STATO_PUBBLICO_ID
+        , PO_STATO_WKF_ID       => V_STATO_WKF_ID
+      );
+      IF PO_MESSAGGIO IS NOT NULL THEN
+         RAISE V_ERRORE;
+      END IF;
+      --
+    EXCEPTION
+      WHEN V_ERRORE THEN NULL;
+      WHEN OTHERS THEN
+        BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END AGGIORNA_STATO_SCHEDE_CL;
+    --
+    --
+    -- PROCEDURA CHE AGGIURNA IL RECORD DELLA CRONOLOGIA_KPI CON L'ID DEL PENALTY CALCOLATO
+    PROCEDURE AGGIORNA_CRONOLOGIA_PENALTY( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                            PO_ERR_CODICE            IN OUT VARCHAR2,
+                                            PO_MESSAGGIO             IN OUT VARCHAR2,
+                                            P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                            P_OPEID                  IN     VARCHAR2,
+                                            P_RUOLOID                IN     VARCHAR2,
+                                            P_CONTESTO               IN     CLOB,
+                                            V_PENALTY_ID             IN     VARCHAR2,
+                                            V_PEN_DATA_INI           IN     TIMESTAMP,
+                                            V_PEN_VERSIONE           IN     NUMBER,
+                                            V_CRONOLOGIA_KPI_ID      IN     VARCHAR2,
+                                            V_CRONO_DATA_INI         IN     TIMESTAMP,
+                                            V_CRONO_VERSIONE         IN     NUMBER
+                                            )
+    IS
+        V_PROC_NAME             VARCHAR2(100):=K_NOME_PACKAGE||'.AGGIORNA_CRONOLOGIA_PENALTY';
+    BEGIN
+
+        UPDATE KPI_CRONOLOGIA_KPI  KCK
+            SET
+                KCK.KPEN_PENALTY_ID  = V_PENALTY_ID
+                ,KCK.KPEN_DATA_INI   = V_PEN_DATA_INI
+                ,KCK.KPEN_VERSIONE   = V_PEN_VERSIONE
+            WHERE
+                KCK.KCK_CRONOLOGIA_KPI_ID = V_CRONOLOGIA_KPI_ID
+            AND KCK.KCK_DATA_INI          = V_CRONO_DATA_INI
+            AND KCK.KCK_VERSIONE          = V_CRONO_VERSIONE ;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            PO_ERR_SEVERITA := 'F';
+            PO_ERR_CODICE   := SQLCODE;
+            PO_MESSAGGIO    := 'Proc '|| V_PROC_NAME || EDW_LOGGER_PCK.DECODE_COD(PO_ERR_CODICE, TRUE, P_LINGUAID);
+
+
+    END AGGIORNA_CRONOLOGIA_PENALTY;
+
+--
+  FUNCTION CHEK_KPI_RISPETTO_FASCIA(P_KPI_ID             IN     VARCHAR2,
+                                    P_LIVSER_REL_KPI_ID  IN     VARCHAR2
+                                    ) RETURN BOOLEAN
+  IS
+  V_ESITO             BOOLEAN:= FALSE;
+  V_RISPETTO_FASCIA   VARCHAR2 (5) := 'N';
+
+  BEGIN
+     --
+     --dbms_output.put_line('V_RISPETTO_FASCIA: '||V_RISPETTO_FASCIA);
+     SELECT KOPZ_RISPETTO_FASCIA
+     INTO V_RISPETTO_FASCIA
+     FROM  KPI_LIVSER_REL_KPI    KLRK,
+           KPIB_OPZIONI_CALCOLO  KOPZ
+     WHERE KLRK.RLSKI_LIVSER_REL_KPI_ID  = P_LIVSER_REL_KPI_ID
+       AND KLRK.RLSKI_DATA_VER_FIN       = EDW_UTILITA.GET_DATA_SUP
+       AND KLRK.RLSKI_FLAG_ANN           = 'N'
+       AND KLRK.KPI_KPI_ID               = P_KPI_ID
+       AND KOPZ.KOPZ_OPZIONE_CALCOLO_ID  = KLRK.KOPZ_OPZIONE_CALCOLO_ID
+       AND KOPZ.KOPZ_DATA_VER_FIN        = EDW_UTILITA.GET_DATA_SUP
+       AND KOPZ.KOPZ_FLAG_ANN            = 'N'
+       AND KOPZ.KPI_KPI_ID               = P_KPI_ID;
+    --
+    --dbms_output.put_line('V_RISPETTO_FASCIA: '||V_RISPETTO_FASCIA);
+    IF V_RISPETTO_FASCIA = 'S' THEN
+      V_ESITO := TRUE;
+      RETURN V_ESITO;
+    ELSE
+      V_ESITO := FALSE;
+      RETURN V_ESITO;
+    END IF;
+      --
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      --dbms_output.put_line('NO_DATA_FOUND: '||sqlerrm);
+      V_ESITO := FALSE;
+      RETURN V_ESITO;
+    WHEN TOO_MANY_ROWS THEN
+    --dbms_output.put_line('TOO_MANY_ROWS: '||sqlerrm);
+      V_ESITO := FALSE;
+      RETURN V_ESITO;
+    WHEN OTHERS THEN
+    --dbms_output.put_line('OTHERS: '||sqlerrm);
+      V_ESITO := FALSE;
+      RETURN V_ESITO;
+  END CHEK_KPI_RISPETTO_FASCIA;
+
+    -- procedura che si ricava la data inizio e fine kpi e le inserisce nei campi scin_data_inizio e scin_data_fine
+   PROCEDURE CALCOLA_DATA_INIZIO_FINE( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                        PO_ERR_CODICE            IN OUT VARCHAR2,
+                                        PO_MESSAGGIO             IN OUT VARCHAR2,
+                                        P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                        P_OPEID                  IN     VARCHAR2,
+                                        P_RUOLOID                IN     VARCHAR2,
+                                        P_CONTESTO               IN     CLOB,
+                                        P_TAB_SCHEDE_PEN         IN OUT KPI_SCHEDE_PEN_EXT_TAB
+                                       )
+    IS
+        V_PROC_NAME             VARCHAR2(100):=K_NOME_PACKAGE||'.CALCOLA_DATA_INIZIO_FINE';
+        vPasso                  VARCHAR2(100);
+        V_DATA_INIZIO           TIMESTAMP;
+        V_DATA_FINE             TIMESTAMP;
+        V_USCITA                EXCEPTION;
+
+        V_LIVSER_REL_KPI_ID     KPI_CRONOLOGIA_KPI.RLSKI_LIVSER_REL_KPI_ID%type;
+        V_APPUNTAMENTO_COD      KPI_CRONOLOGIA_KPI.KCK_APPUNTAMENTO_COD%type;
+        --
+        TYPE T_BOOL IS TABLE OF BOOLEAN  INDEX BY VARCHAR2(16);
+        vCache_RISPETTO_FASCIA   T_BOOL;
+        vRisp   BOOLEAN;
+        vAppo                   VARCHAR2(4000);
+    BEGIN
+      --
+      --
+      FOR I IN 1.. P_TAB_SCHEDE_PEN.COUNT LOOP
+        --
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK = 'KO' THEN CONTINUE; END IF;
+        --
+        -- SBIANCO LE VARIBILI DA RICERCARE
+        V_DATA_INIZIO := NULL;
+        V_DATA_FINE   := NULL;
+        --
+        V_LIVSER_REL_KPI_ID := NULL;
+        V_APPUNTAMENTO_COD  := NULL;
+        --
+        vPasso := 'CK_APP '||I;
+        BEGIN
+          SELECT KCK.RLSKI_LIVSER_REL_KPI_ID,
+                 KCK.KCK_APPUNTAMENTO_COD
+          INTO V_LIVSER_REL_KPI_ID,
+               V_APPUNTAMENTO_COD
+          FROM  KPI_CRONOLOGIA_KPI KCK
+          WHERE KCK.KCK_CRONOLOGIA_KPI_ID = P_TAB_SCHEDE_PEN(I).KCK_CRONOLOGIA_KPI_ID
+            AND KCK.KCK_FLAG_ANN          = 'N'
+            AND KCK.KCK_DATA_VER_FIN      = K_PIU_INFINITO
+            and KCK.KPI_KPI_ID            = P_TAB_SCHEDE_PEN(I).KPI_KPI_ID;
+        EXCEPTION
+          --
+          WHEN NO_DATA_FOUND THEN
+            V_LIVSER_REL_KPI_ID := NULL;
+            V_APPUNTAMENTO_COD  := NULL;
+        END;
+        --
+        --
+        -- Gestisco in cache il rispetto fascia per il livello di servizio
+        vPasso := 'LIVSER '||I;
+        vRisp := FALSE;
+        IF V_LIVSER_REL_KPI_ID IS NOT NULL THEN
+          IF vCache_RISPETTO_FASCIA.EXISTS(V_LIVSER_REL_KPI_ID) THEN
+            vRisp := vCache_RISPETTO_FASCIA(V_LIVSER_REL_KPI_ID);
+          ELSE
+            vRisp := CHEK_KPI_RISPETTO_FASCIA(P_TAB_SCHEDE_PEN(I).KPI_KPI_ID, V_LIVSER_REL_KPI_ID);
+            vCache_RISPETTO_FASCIA(V_LIVSER_REL_KPI_ID) := vRisp;
+          END IF;
+        END IF;
+
+        IF vRisp THEN
+
+          BEGIN
+            vPasso := 'APPA '||V_APPUNTAMENTO_COD;
+            SELECT /*+
+                  INDEX(APIP)
+                  INDEX(APP)
+                  */
+                CASE
+                  WHEN APPA_CONSENSO_ANTICIPO = 'S' THEN
+                    -- Consentito anticipo, la sponda sinistra è mezzanotte
+                    TRUNC(APPA.APPA_DATA_APPUNTAMENTO)
+                  ELSE
+                    TRUNC(APPA.APPA_DATA_APPUNTAMENTO) + (APPA.APPA_DATA_APP_FASCIA_FINE - TRUNC(APPA.APPA_DATA_APP_FASCIA_INI))
+                END  DATA_APPUNTAMENTO_FISSATO,
+                APPA.APPA_DATA_ARRIVO_TECNICO
+            INTO V_DATA_INIZIO
+                ,V_DATA_FINE
+            FROM TRM_APPUNTAMENTI_AGENDA APPA
+            WHERE  APPA.APPA_APPUNTAMENTO_COD = V_APPUNTAMENTO_COD;
+              --
+              P_TAB_SCHEDE_PEN(I).SCIN_DATA_INIZIO := V_DATA_INIZIO;
+              P_TAB_SCHEDE_PEN(I).SCIN_DATA_FINE   := V_DATA_FINE;
+              --
+          EXCEPTION
+            --
+            WHEN NO_DATA_FOUND THEN
+                P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+                KPI_GESTIONE_INDENNIZZI_UTIL.INVIA_SEGNALAZIONE(
+                                                              PO_ERR_SEVERITA  => PO_ERR_SEVERITA,
+                                                              PO_ERR_CODICE    => PO_ERR_CODICE,
+                                                              PO_MESSAGGIO     => PO_MESSAGGIO,
+                                                              P_PROC           => V_PROC_NAME,
+                                                              P_SGN_CODE       => 'KPI0110',
+                                                              P_SGN_PAR1       => P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_COD,
+                                                              P_SGN_PAR2       => EDW_LOGGER_PCK.DECODE_COD('KPIGIND022', FALSE, P_LINGUAID),
+                                                              P_SGN_PAR3       => '',
+                                                              P_SGN_PAR4       => '',
+                                                              P_SGN_PAR5       => '',
+                                                              P_SGN_PAR6       => '',
+                                                              P_SGN_PAR7       => '',
+                                                              P_SGN_PAR8       => '',
+                                                              P_LINGUAID       => P_LINGUAID,
+                                                              PO_MSG_SCRITTO   => vAppo,
+                                                              P_RETURN_MSG     => TRUE
+                                                              );
+                -- Messaggio non bloccante
+                P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO := vAppo || kAccapo|| P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO;
+                --
+            WHEN OTHERS THEN
+              BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+              RAISE V_USCITA;
+          END;
+          --
+        ELSE
+          --
+          BEGIN
+            --
+            vPasso := 'CRONO_INI';
+            SELECT WKFC_DATA_COMPETENZA
+            INTO V_DATA_INIZIO
+            FROM WKF_CRONOLOGIA CRONO_INI
+            WHERE CRONO_INI.WKFC_CRONOLOGIA_ID = P_TAB_SCHEDE_PEN(I).WKFC_CRONOLOGIA_ID_INKPI;
+
+            P_TAB_SCHEDE_PEN(I).SCIN_DATA_INIZIO := V_DATA_INIZIO;
+            --
+          EXCEPTION
+            --
+            WHEN NO_DATA_FOUND THEN
+                P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+                KPI_GESTIONE_INDENNIZZI_UTIL.INVIA_SEGNALAZIONE(
+                                                              PO_ERR_SEVERITA  => PO_ERR_SEVERITA,
+                                                              PO_ERR_CODICE    => PO_ERR_CODICE,
+                                                              PO_MESSAGGIO     => PO_MESSAGGIO,
+                                                              P_PROC           => V_PROC_NAME,
+                                                              P_SGN_CODE       => 'KPI0110',
+                                                              P_SGN_PAR1       => P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_COD,
+                                                              P_SGN_PAR2       => EDW_LOGGER_PCK.DECODE_COD('KPIGIND022', FALSE, P_LINGUAID),
+                                                              P_SGN_PAR3       => '',
+                                                              P_SGN_PAR4       => '',
+                                                              P_SGN_PAR5       => '',
+                                                              P_SGN_PAR6       => '',
+                                                              P_SGN_PAR7       => '',
+                                                              P_SGN_PAR8       => '',
+                                                              P_LINGUAID       => P_LINGUAID,
+                                                              PO_MSG_SCRITTO   => P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO,
+                                                              P_RETURN_MSG     => TRUE
+                                                              );
+
+            WHEN OTHERS THEN
+              BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+              RAISE V_USCITA;
+          END;
+
+          BEGIN
+            vPasso := 'CRONO_FIN';
+            SELECT WKFC_DATA_COMPETENZA
+            INTO V_DATA_FINE
+            FROM WKF_CRONOLOGIA CRONO_INI
+            WHERE CRONO_INI.WKFC_CRONOLOGIA_ID = P_TAB_SCHEDE_PEN(I).WKFC_CRONOLOGIA_ID_FIKPI;
+
+            P_TAB_SCHEDE_PEN(I).SCIN_DATA_FINE := V_DATA_FINE;
+
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              --
+              IF P_TAB_SCHEDE_PEN(I).KSTK_STATO_KPI_ID = K_KPI_CHIUSO THEN
+                KPI_GESTIONE_INDENNIZZI_UTIL.INVIA_SEGNALAZIONE(
+                                                              PO_ERR_SEVERITA  => PO_ERR_SEVERITA,
+                                                              PO_ERR_CODICE    => PO_ERR_CODICE,
+                                                              PO_MESSAGGIO     => PO_MESSAGGIO,
+                                                              P_PROC           => V_PROC_NAME,
+                                                              P_SGN_CODE       => 'KPI0110',
+                                                              P_SGN_PAR1       => P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_COD,
+                                                              P_SGN_PAR2       => EDW_LOGGER_PCK.DECODE_COD('KPIGIND023', FALSE, P_LINGUAID),
+                                                              P_SGN_PAR3       => '',
+                                                              P_SGN_PAR4       => '',
+                                                              P_SGN_PAR5       => '',
+                                                              P_SGN_PAR6       => '',
+                                                              P_SGN_PAR7       => '',
+                                                              P_SGN_PAR8       => '',
+                                                              P_LINGUAID       => P_LINGUAID,
+                                                              PO_MSG_SCRITTO   => P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO,
+                                                              P_RETURN_MSG     => TRUE
+                                                              );
+              END IF;
+            WHEN OTHERS THEN
+              BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+              RAISE V_USCITA;
+          END;
+        END IF;
+        --
+      END LOOP;
+      --
+    EXCEPTION
+          WHEN V_USCITA THEN
+            --RITORNO AL CHIAMANTE
+            KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'---> Errore in proc '||V_PROC_NAME ||'('||vPasso||') : '||PO_MESSAGGIO);
+          WHEN OTHERS THEN
+            BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END CALCOLA_DATA_INIZIO_FINE;
+
+     --- procedura che calcola l'importo effettivo legato alla fornitura o al soggetto
+    PROCEDURE CALCOLA_DATA_SCADENZA(
+        PO_ERR_SEVERITA          IN OUT VARCHAR2,
+        PO_ERR_CODICE            IN OUT VARCHAR2,
+        PO_MESSAGGIO             IN OUT VARCHAR2,
+        P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+        P_OPEID                  IN     VARCHAR2,
+        P_RUOLOID                IN     VARCHAR2,
+        P_CONTESTO               IN     CLOB,
+        P_TAB_SCHEDE_PEN         IN OUT KPI_SCHEDE_PEN_EXT_TAB
+      )
+    IS
+      V_PROC_NAME               VARCHAR2(100):=K_NOME_PACKAGE||'.CALCOLA_DATA_SCADENZA';
+      V_USCITA                  EXCEPTION;
+      vMesiLimCorresponsione    NUMBER;
+      vPasso                    VARCHAR2(100);
+      vBk_TIPO_PENALTY          VARCHAR2(100) := '-';
+      vMsg                      VARCHAR2(4000);
+    BEGIN
+      --DBMS_OUTPUT.PUT_LINE('INIZIO PROCEDURA CALCOLA IMPORTO EFFETTIVO');
+      FOR I IN 1.. P_TAB_SCHEDE_PEN.COUNT LOOP
+        --
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK = 'KO' THEN CONTINUE; END IF;
+        --
+        BEGIN
+          -- Dovrebbe essere sempre lo stesso tipo indennizzo, ma non si sa mai
+          IF P_TAB_SCHEDE_PEN(I).SCIN_TIPO_PENALTY != vBk_TIPO_PENALTY THEN
+            --
+            vBk_TIPO_PENALTY := P_TAB_SCHEDE_PEN(I).SCIN_TIPO_PENALTY;
+            vMsg := NULL;
+            vMesiLimCorresponsione := null;
+            --
+            SELECT /*+ USE_NL(KTIND) INDEX(KTIND)
+             */  KTIND.KTIND_NUM_MESI_LIMITE_CORRESP
+            INTO vMesiLimCorresponsione
+            FROM KPI_TIPI_INDENNIZZO_DETT KTIND
+            WHERE KTIND.KTIN_TIPO_INDENNIZZO_ID  =P_TAB_SCHEDE_PEN(I).SCIN_TIPO_PENALTY
+              AND KTIND.KTIND_DATA_VER_FIN = Edw_Qbe_Api_Pck.GetKStampFin
+              AND KTIND.KTIND_FLAG_ANN = 'N'
+              AND KTIND.KTIND_FLAG_TIPO_DETT = 'LIM';
+          END IF;
+            --
+        EXCEPTION
+          WHEN OTHERS THEN
+            PO_ERR_CODICE := 'KPIIND040';-- Errore in lettura del limite corresponsione per tipo indennizzo <PAR>
+            BASE_SEGNALAZIONI_PCK.SEGNALA_ERRORE_CAUSA_EXCEPTION(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, '');
+            vMsg := PO_MESSAGGIO;
+            PO_ERR_SEVERITA := NULL;
+            PO_ERR_CODICE   := NULL;
+            PO_MESSAGGIO    := NULL;
+        END;
+        --
+        IF vMsg IS NOT NULL THEN
+          P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+          P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO := vMsg;
+        ELSE
+          P_TAB_SCHEDE_PEN(I).SCIN_DATA_SCADENZA_PAGAMENTO := ADD_MONTHS(P_TAB_SCHEDE_PEN(I).SCIN_DATA_FINE, vMesiLimCorresponsione);
+        END IF;
+        --
+      END LOOP;
+      --
+    EXCEPTION
+          WHEN V_USCITA THEN
+            KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'---> Errore in proc '||V_PROC_NAME ||'('||vPasso||') : '||PO_MESSAGGIO);
+          WHEN OTHERS THEN
+            BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END CALCOLA_DATA_SCADENZA;
+
+
+    --- procedura che calcola l'importo effettivo legato alla fornitura o al soggetto
+    PROCEDURE CALCOLA_IMPORTO_EFFETTIVO( PO_ERR_SEVERITA          IN OUT VARCHAR2,
+                                          PO_ERR_CODICE            IN OUT VARCHAR2,
+                                          PO_MESSAGGIO             IN OUT VARCHAR2,
+                                          P_LINGUAID               IN     EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+                                          P_OPEID                  IN     VARCHAR2,
+                                          P_RUOLOID                IN     VARCHAR2,
+                                          P_CONTESTO               IN     CLOB,
+                                          P_DATA_COMPETENZA        IN     TIMESTAMP,
+                                          P_CON_PENALE             IN     VARCHAR2,
+                                          -- SI= calcola importo con penale NO= calcola importo senza penale
+                                          P_TAB_SCHEDE_PEN         IN OUT KPI_SCHEDE_PEN_EXT_TAB
+                                          )
+    IS
+        V_PROC_NAME               VARCHAR2(100):=K_NOME_PACKAGE||'.CALCOLA_IMPORTO_EFFETTIVO';
+        vPasso                    VARCHAR2(100);
+        V_IMPORTO_CALCOLATO       NUMBER;
+        V_VOCE_ID                 VARCHAR2(16);
+        V_GG_TRASCORSI            VARCHAR2(16);
+        --
+        V_USCITA                  EXCEPTION;
+        --
+        -- Index by V_VOCE_ID@CLU_CLASSE_FORNITURA_ID[V_GG_TRASCORSI]
+        TYPE T_CACHE_IMPORTO      IS TABLE OF NUMBER INDEX BY VARCHAR2(50);
+        vCacheImporto             T_CACHE_IMPORTO;
+        vChiaveImporto            VARCHAR2(50);
+    BEGIN
+      --
+      FOR I IN 1.. P_TAB_SCHEDE_PEN.COUNT LOOP
+
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK = 'KO' THEN CONTINUE; END IF;
+
+        V_IMPORTO_CALCOLATO := NULL;
+
+        IF P_CON_PENALE = K_SI THEN
+          V_VOCE_ID           := NULL;
+          -- ricavo l'id della voce fatturabile dalla tabella kpi_penalty se devo applicare la penale
+          BEGIN
+            SELECT KPEN.VOF_VOCE_FATTURABILE_ID_PEN
+            INTO V_VOCE_ID
+            FROM KPI_PENALTY KPEN
+            -- Uso la terna storica perchè voglio esattsmente il record già letto in get_importo_base
+            WHERE KPEN.KPEN_PENALTY_ID = P_TAB_SCHEDE_PEN(I).KPEN_PENALTY_ID
+              AND KPEN.KPEN_DATA_INI   = P_TAB_SCHEDE_PEN(I).KPEN_DATA_INI
+              AND KPEN.KPEN_VERSIONE   = P_TAB_SCHEDE_PEN(I).KPEN_VERSIONE;
+            --
+            P_TAB_SCHEDE_PEN(I).SCIN_ID_VOCE_FATTURABILE := V_VOCE_ID;
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              KPI_GESTIONE_INDENNIZZI_UTIL.INVIA_SEGNALAZIONE(
+                PO_ERR_SEVERITA  => PO_ERR_SEVERITA,
+                PO_ERR_CODICE    => PO_ERR_CODICE,
+                PO_MESSAGGIO     => PO_MESSAGGIO,
+                P_PROC           => V_PROC_NAME,
+                P_SGN_CODE       => 'KPI0107',
+                P_SGN_PAR1       => P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_COD,
+                P_SGN_PAR2       => EDW_LOGGER_PCK.DECODE_COD('KPIGIND025', FALSE, P_LINGUAID),
+                P_SGN_PAR3       => '',
+                P_SGN_PAR4       => '',
+                P_SGN_PAR5       => '',
+                P_SGN_PAR6       => '',
+                P_SGN_PAR7       => '',
+                P_SGN_PAR8       => '',
+                P_LINGUAID       => P_LINGUAID,
+                PO_MSG_SCRITTO   => P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO,
+                P_RETURN_MSG     => TRUE
+              );
+              P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+            WHEN OTHERS THEN
+              BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+          END;
+        END IF;
+
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK = 'KO' THEN CONTINUE; END IF;
+
+        --DBMS_OUTPUT.PUT_LINE('V_VOCE_ID = '||V_VOCE_ID || ' '||P_TAB_SCHEDE_PEN(I).KPEN_PENALTY_ID ||' '||P_TAB_SCHEDE_PEN(I).WKFC_DATA_COMPETENZA_FIN);
+        -- VALORIZZO I GIORNI TRASCORSI CON
+        V_GG_TRASCORSI := P_TAB_SCHEDE_PEN(I).KCK_TEMPO_TRASCORSO;
+        V_VOCE_ID := P_TAB_SCHEDE_PEN(I).SCIN_ID_VOCE_FATTURABILE;
+        --
+        IF V_VOCE_ID IS NOT NULL AND V_GG_TRASCORSI IS NOT NULL THEN
+          --
+          vChiaveImporto := V_VOCE_ID||'@'||P_TAB_SCHEDE_PEN(I).CLU_CLASSE_FORNITURA_ID||'['||V_GG_TRASCORSI||']';
+
+          IF vCacheImporto.Exists(vChiaveImporto) THEN
+            V_IMPORTO_CALCOLATO := vCacheImporto(vChiaveImporto);
+          ELSE
+            DOC_GESTIONE_FATTURE_PCK.CALCOLA_IMP_INDENNIZZO ( PO_ERR_SEVERITA
+                                                             ,PO_ERR_CODICE
+                                                             ,PO_MESSAGGIO
+                                                             ,V_VOCE_ID--P_VOCE_ID                     --IN     tar_voci_fatturabili.vof_voce_fatturabile_id%type
+                                                             ,P_TAB_SCHEDE_PEN(I).CLU_CLASSE_FORNITURA_ID
+                                                             ,P_TAB_SCHEDE_PEN(I).CLU_DATA_INI
+                                                             ,P_TAB_SCHEDE_PEN(I).CLU_VERSIONE
+                                                             ,V_GG_TRASCORSI
+                                                             ,V_IMPORTO_CALCOLATO           --   OUT pre_prezzi.prz_prezzo%type
+                                                             ,P_DATA_COMPETENZA             --IN     timestamp := SYSTIMESTAMP
+                                                            );
+            IF PO_MESSAGGIO IS NOT NULL  THEN RAISE V_USCITA; END IF;
+            vCacheImporto(vChiaveImporto) := V_IMPORTO_CALCOLATO;
+          END IF;
+
+          IF(V_IMPORTO_CALCOLATO IS NULL)THEN
+              KPI_GESTIONE_INDENNIZZI_UTIL.INVIA_SEGNALAZIONE(
+                                                               PO_ERR_SEVERITA  => PO_ERR_SEVERITA,
+                                                               PO_ERR_CODICE    => PO_ERR_CODICE,
+                                                               PO_MESSAGGIO     => PO_MESSAGGIO,
+                                                               P_PROC           => V_PROC_NAME,
+                                                               P_SGN_CODE       => 'KPI0107',
+                                                               P_SGN_PAR1       => P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_COD,
+                                                               P_SGN_PAR2       => EDW_LOGGER_PCK.DECODE_COD('KPIGIND026', FALSE, P_LINGUAID),
+                                                               P_SGN_PAR3       => '',
+                                                               P_SGN_PAR4       => '',
+                                                               P_SGN_PAR5       => '',
+                                                               P_SGN_PAR6       => '',
+                                                               P_SGN_PAR7       => '',
+                                                               P_SGN_PAR8       => '',
+                                                               P_LINGUAID       => P_LINGUAID,
+                                                               PO_MSG_SCRITTO   => P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO,
+                                                               P_RETURN_MSG     => TRUE
+                                                               );
+              P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+          END IF;
+          --
+          P_TAB_SCHEDE_PEN(I).SCIN_IMPORTO_INDENNIZZO := V_IMPORTO_CALCOLATO;
+          --
+        END IF;
+        --DBMS_OUTPUT.PUT_LINE('PROCESSO = '||P_TAB_SCHEDE_PEN(I).PROc_PROCESSO_COD ||' ESISTO -->'||P_TAB_SCHEDE_PEN(I).FLAG_KO_OK||' '||P_TAB_SCHEDE_PEN(I).SCIN_IMPORTO_INDENNIZZO );
+      END LOOP;
+      --
+    EXCEPTION
+          WHEN V_USCITA THEN
+            KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'---> Errore in proc '||V_PROC_NAME ||'('||vPasso||') : '||PO_MESSAGGIO);
+          WHEN OTHERS THEN
+            BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END CALCOLA_IMPORTO_EFFETTIVO;
+    --
+  -- La proceura inserisce una scheda penalty SENZA eseguire alcun controllo ad eccezione dello stato morosità del soggetto
+    PROCEDURE INSERISCI_SINGOLA_SCHEDA_IND(
+      PO_ERR_SEVERITA                IN OUT   VARCHAR2,
+      PO_ERR_CODICE                  IN OUT   VARCHAR2,
+      PO_MESSAGGIO                   IN OUT   VARCHAR2,
+      P_LINGUAID                     IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                        IN       VARCHAR2,
+      P_RUOLOID                      IN       VARCHAR2,
+      P_SUPERUSER                    IN       VARCHAR2,
+      PO_EDW_PERMESSI                IN OUT NOCOPY  XMLTYPE,
+      P_CONTESTO                     IN       EDW_CONTESTO_API_PCK.T_CONTESTO,
+      PO_SCHEDA_PEN                  IN OUT   NOCOPY KPI_T_EXT_SCHEDE_PEN,
+      PO_STATO_WKF_ID                IN OUT   NOCOPY VARCHAR2,
+      PO_STATO_PUBBLICO_ID           IN OUT   NOCOPY VARCHAR2
+    )
+    IS
+        V_PROC_NAME                 VARCHAR2(100):= K_NOME_PACKAGE||'.INSERISCI_SINGOLA_SCHEDA_IND';
+        V_COD_SCHEDA                VARCHAR2(16);
+        V_CODICE_PUBBLICO           varchar2(35);
+        V_DATA_INI_KIRS             timestamp:= EDW_QBE_API_PCK.GETNETASYSTIMESTAMP;
+        V_SCHEDA_PENALTY_ID         VARCHAR2(16);
+        V_STORICO_SCHED_PENALTY     VARCHAR2(16);
+        V_ID                        VARCHAR2(16);
+        V_STATO_PUBBLICO_COD        VARCHAR2(16);
+        V_ID_TOG                    VARCHAR2(16):= 'KPI_SCIN';
+        V_EDW_PERMESSI              CLOB;
+        V_FK_KIRS                   EDW_QBE_API_PCK.tPk;
+        V_PROC_COD                  VARCHAR2(16);
+        V_ERRORE                    EXCEPTION;
+        V_DML                       CLOB;
+        V_FLAG_MOROSO               BOOLEAN:= false;
+        V_NOTA_STATO                VARCHAR2(255);
+        V_COMANDO_STATO             VARCHAR2(16);
+        V_NOTEINDENNIZZO            VARCHAR(4000);
+        vPasso                      VARCHAR2(255);
+        vDmlKIRS                    Edw_Qbe_Api_Pck.tListaQBE;
+        vAppo                        Edw_Qbe_Api_Pck.tRecordQBE;
+    BEGIN
+      --
+      vPasso := 'CREA_QBE';
+      vDmlKIRS(1) := vAppo;
+      KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(vDmlKIRS, 'NoteKIRS' , PO_SCHEDA_PEN.SCIN_NOTA_STATO  , 1);
+      --
+      vPasso := 'INSERISCI_STATI_INDENNIZZI';
+      INSERISCI_STATI_INDENNIZZI(
+          PO_ERR_SEVERITA       => PO_ERR_SEVERITA
+        , PO_ERR_CODICE         => PO_ERR_CODICE
+        , PO_MESSAGGIO          => PO_MESSAGGIO
+        , P_LINGUAID            => P_LINGUAID
+        , P_OPEID               => P_OPEID
+        , P_RUOLOID             => P_RUOLOID
+        , P_SUPERUSER           => P_SUPERUSER
+        , PO_EDW_PERMESSI       => PO_EDW_PERMESSI
+        , P_CONTESTO            => P_CONTESTO
+        , P_DATAVERSIONE        => NULL
+        , P_DECORRENZA          => NULL
+        , PO_DML                => vDmlKIRS
+        , PO_ID                 => V_ID
+        , PO_STATO_PUBBLICO_COD => V_STATO_PUBBLICO_COD
+        , PO_STATO_PUBBLICO_ID  => PO_STATO_PUBBLICO_ID
+        , PO_STATO_WKF_ID       => PO_STATO_WKF_ID
+        , P_COMANDO_STATO       => NULL
+        , P_MODULO_ID           => PO_SCHEDA_PEN.KPI_KPI_ID
+      );
+      IF PO_MESSAGGIO IS NOT NULL THEN
+         RAISE V_ERRORE;
+      END IF;
+      --
+      vPasso := 'DATI';
+      --
+      --DBMS_OUTPUT.PUT_LINE('NELLA INSERISCI_SCHEDE_INDENNIZZI PRIMA DELLA INSERT IN KPI_SCHEDE_PENALTY');
+      V_FK_KIRS := KPI_IND_REL_STATI_INF.GET_FK(V_ID);
+      PO_SCHEDA_PEN.KIRS_IND_REL_STATO_ID := V_FK_KIRS.id_storico;
+      PO_SCHEDA_PEN.KIRS_DATA_INI := V_FK_KIRS.DATA_INI;
+      PO_SCHEDA_PEN.KIRS_VERSIONE := V_FK_KIRS.VERSIONE;
+      --
+      PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID := NVL(PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID, edw_qbe_api_pck.neta_guid);
+      PO_SCHEDA_PEN.SCIN_DATA_INI  := NVL(PO_SCHEDA_PEN.SCIN_DATA_INI, K_MENO_INFINITO);
+      PO_SCHEDA_PEN.SCIN_VERSIONE  := NVL(PO_SCHEDA_PEN.SCIN_VERSIONE, 0);
+      PO_SCHEDA_PEN.SCIN_STATO     := V_STATO_PUBBLICO_COD;
+      --
+      IF PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD IS NULL THEN
+        PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD := KPI_KPEN_ID_SEQ.NEXTVAL;
+      END IF;
+      --
+      IF PO_SCHEDA_PEN.CTSOS_TIPCAU_SOSP_ID IS NOT NULL AND
+        (PO_SCHEDA_PEN.CTSOS_DATA_INI IS NULL OR
+        PO_SCHEDA_PEN.CTSOS_VERSIONE IS NULL) THEN
+        --
+        -- COMPLETO FK CTSOS
+        SELECT CTSOS_DATA_INI, CTSOS_VERSIONE
+        INTO PO_SCHEDA_PEN.CTSOS_DATA_INI, PO_SCHEDA_PEN.CTSOS_VERSIONE
+        FROM CBL_TIPCAU_SOSP CTSOS
+        WHERE CTSOS.CTSOS_TIPCAU_SOSP_ID  = PO_SCHEDA_PEN.CTSOS_TIPCAU_SOSP_ID;
+        --
+      END IF;
+      --
+      PO_SCHEDA_PEN.SCIN_DATAMODIFICA := EDW_QBE_API_PCK.GetNetasysTimestamp;
+      vPasso := 'KPI_SCHEDE_PENALTY';
+      INSERT INTO KPI_SCHEDE_PENALTY(
+           SCIN_SCHEDA_PENALTY_ID
+          ,SCIN_SCHEDA_PENALTY_COD
+          ,SCIN_STATO
+          ,SCIN_DATA_STATO
+          ,SCIN_DATA_INIZIO
+          ,WKFI_ISTANZA_WORKFLOW_ID
+          ,SCIN_DATA_FINE
+          ,SCIN_IMPORTO_BASE
+          ,SCIN_DATA_CREAZIONE_INDENNIZZO
+          ,SCIN_DATA_MASSIMA
+          ,SCIN_IMPORTO_INDENNIZZO
+          ,SCIN_TIPO_PENALTY
+          ,CLU_CLASSE_FORNITURA_ID
+          ,SCIN_DATA_PAGAMENTO
+          ,LIS_LIVELLO_SERVIZIO_ID
+          ,UMI_UNITA_DI_MISURA_ID_BASE
+          ,UMI_UNITA_DI_MISURA_ID_EFFET
+          ,SCIN_NOTA_STATO
+          ,MSG_MESSAGGIO_ID
+          ,UOPL_UNITA_OP_ID
+          ,PLAY_PLAYER_ID
+          ,PUN_PUNTO_EROGAZIONE_ID
+          ,CAB_CABINA_ID
+          ,KPI_KPI_ID
+          ,ALIN_ALLEGATO_IND_ID
+          ,FORN_FORNITURA_ID
+          ,TSE_TIPO_SERVIZIO_ID
+          ,CONC_CONCESSIONE_ID
+          ,SOG_SOGGETTO_ID_INT
+          ,SOG_SOGGETTO_ID_EST
+          ,PROC_PROCESSO_ID
+          ,TPR_TIPO_PROCESSO_ID
+          ,KIRS_IND_REL_STATO_ID
+          ,KCK_CRONOLOGIA_KPI_ID
+          ,KDKPI_DEFINIZIONE_KPI_ID
+          ,KLOT_LOTTO_IND_ID
+          ,SCIN_DATA_INI_PROC
+          ,UMI_DATA_INI_EFFET
+          ,UMI_VERSIONE_EFFET
+          ,WKFI_DATA_INI
+          ,WKFI_VERSIONE
+          ,PUN_DATA_INI
+          ,PUN_VERSIONE
+          ,MSG_DATA_INI
+          ,MSG_VERSIONE
+          ,CLU_DATA_INI
+          ,CLU_VERSIONE
+          ,UMI_DATA_INI_BASE
+          ,UMI_VERSIONE_BASE
+          ,PLAY_DATA_INI
+          ,PLAY_VERSIONE
+          ,LIS_DATA_INI
+          ,LIS_VERSIONE
+          ,SOG_DATA_INI_INT
+          ,SOG_VERSIONE_INT
+          ,CAB_DATA_INI
+          ,CAB_VERSIONE
+          ,KPI_DATA_INI
+          ,KPI_VERSIONE
+          ,SOG_DATA_INI_EST
+          ,SOG_VERSIONE_EST
+          ,UOPL_DATA_INI
+          ,UOPL_VERSIONE
+          ,ALIN_DATA_INI
+          ,ALIN_VERSIONE
+          ,TSE_DATA_INI
+          ,TSE_VERSIONE
+          ,FORN_DATA_INI
+          ,FORN_VERSIONE
+          ,CONC_DATA_INI
+          ,CONC_VERSIONE
+          ,PROC_DATA_INI
+          ,PROC_VERSIONE
+          ,TPR_DATA_INI
+          ,TPR_VERSIONE
+          ,KIRS_DATA_INI
+          ,KIRS_VERSIONE
+          ,KCK_DATA_INI
+          ,KCK_VERSIONE
+          ,KDKPI_DATA_INI
+          ,KDKPI_VERSIONE
+          ,KLOT_DATA_INI
+          ,KLOT_VERSIONE
+          ,SCIN_STORICO_ID
+          ,SCIN_DATA_INI
+          ,SCIN_VERSIONE
+          ,SCIN_DATA_FIN
+          ,SCIN_DATA_LIM
+          ,SCIN_DATA_VER_INI
+          ,SCIN_DATA_VER_FIN
+          ,SCIN_FLAG_ANN
+          ,SCIN_DATAMODIFICA
+          ,VAL_VALORE_ID
+          ,VAL_DATA_INI
+          ,VAL_VERSIONE
+          ,SCIN_ID_VOCE_FATTURABILE
+          ,SCIN_DATA_SCADENZA_PAGAMENTO
+          ,DOC_DOCUMENTO_ID
+          ,DOC_DATA_INI
+          ,DOC_VERSIONE
+          ,SCIN_DATA_EMISSIONE_DOCUMENTO
+          ,SCIN_GG_SCOSTAMENTO
+          ,SCIN_NUM_FATTURAZIONI_PREVISTE
+          ,SCIN_NUM_FATTURAZIONI_ESEGUITE
+          ,CTSOS_TIPCAU_SOSP_ID
+          ,CTSOS_DATA_INI
+          ,CTSOS_VERSIONE
+          ,CLS_CLASSE_STRUMENTO_ID
+          ,CLS_DATA_INI
+          ,CLS_VERSIONE
+          ,SCIN_INDENNIZZO_CF
+          ,TUT_TIPO_UTILIZZO_ID
+          ,TUT_DATA_INI
+          ,TUT_VERSIONE
+          ,RMV_REMI_VIRTUALE_ID
+          ,RMV_DATA_INI
+          ,RMV_VERSIONE
+          ,IND_INDIRIZZO_ID
+          ,IND_DATA_INI
+          ,IND_VERSIONE
+          ,SCIN_IMPORTO_MAGGIORATO
+          )
+       VALUES (
+          PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID
+        ,PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD
+        ,PO_SCHEDA_PEN.SCIN_STATO
+        ,PO_SCHEDA_PEN.SCIN_DATA_STATO
+        ,PO_SCHEDA_PEN.SCIN_DATA_INIZIO
+        ,PO_SCHEDA_PEN.WKFI_ISTANZA_WORKFLOW_ID
+        ,PO_SCHEDA_PEN.SCIN_DATA_FINE
+        ,PO_SCHEDA_PEN.SCIN_IMPORTO_BASE
+        ,PO_SCHEDA_PEN.SCIN_DATA_CREAZIONE_INDENNIZZO
+        ,PO_SCHEDA_PEN.SCIN_DATA_MASSIMA
+        ,PO_SCHEDA_PEN.SCIN_IMPORTO_INDENNIZZO
+        ,PO_SCHEDA_PEN.SCIN_TIPO_PENALTY
+        ,PO_SCHEDA_PEN.CLU_CLASSE_FORNITURA_ID
+        ,PO_SCHEDA_PEN.SCIN_DATA_PAGAMENTO
+        ,PO_SCHEDA_PEN.LIS_LIVELLO_SERVIZIO_ID
+        ,PO_SCHEDA_PEN.UMI_UNITA_DI_MISURA_ID_BASE
+        ,PO_SCHEDA_PEN.UMI_UNITA_DI_MISURA_ID_EFFET
+        ,PO_SCHEDA_PEN.SCIN_NOTA_STATO
+        ,PO_SCHEDA_PEN.MSG_MESSAGGIO_ID
+        ,PO_SCHEDA_PEN.UOPL_UNITA_OP_ID
+        ,PO_SCHEDA_PEN.PLAY_PLAYER_ID
+        ,PO_SCHEDA_PEN.PUN_PUNTO_EROGAZIONE_ID
+        ,PO_SCHEDA_PEN.CAB_CABINA_ID
+        ,PO_SCHEDA_PEN.KPI_KPI_ID
+        ,PO_SCHEDA_PEN.ALIN_ALLEGATO_IND_ID
+        ,PO_SCHEDA_PEN.FORN_FORNITURA_ID
+        ,PO_SCHEDA_PEN.TSE_TIPO_SERVIZIO_ID
+        ,PO_SCHEDA_PEN.CONC_CONCESSIONE_ID
+        ,PO_SCHEDA_PEN.SOG_SOGGETTO_ID_INT
+        ,PO_SCHEDA_PEN.SOG_SOGGETTO_ID_EST
+        ,PO_SCHEDA_PEN.PROC_PROCESSO_ID
+        ,PO_SCHEDA_PEN.TPR_TIPO_PROCESSO_ID
+        ,PO_SCHEDA_PEN.KIRS_IND_REL_STATO_ID
+        ,PO_SCHEDA_PEN.KCK_CRONOLOGIA_KPI_ID
+        ,PO_SCHEDA_PEN.KDKPI_DEFINIZIONE_KPI_ID
+        ,PO_SCHEDA_PEN.KLOT_LOTTO_IND_ID
+        ,PO_SCHEDA_PEN.SCIN_DATA_INI_PROC
+        ,PO_SCHEDA_PEN.UMI_DATA_INI_EFFET
+        ,PO_SCHEDA_PEN.UMI_VERSIONE_EFFET
+        ,PO_SCHEDA_PEN.WKFI_DATA_INI
+        ,PO_SCHEDA_PEN.WKFI_VERSIONE
+        ,PO_SCHEDA_PEN.PUN_DATA_INI
+        ,PO_SCHEDA_PEN.PUN_VERSIONE
+        ,PO_SCHEDA_PEN.MSG_DATA_INI
+        ,PO_SCHEDA_PEN.MSG_VERSIONE
+        ,PO_SCHEDA_PEN.CLU_DATA_INI
+        ,PO_SCHEDA_PEN.CLU_VERSIONE
+        ,PO_SCHEDA_PEN.UMI_DATA_INI_BASE
+        ,PO_SCHEDA_PEN.UMI_VERSIONE_BASE
+        ,PO_SCHEDA_PEN.PLAY_DATA_INI
+        ,PO_SCHEDA_PEN.PLAY_VERSIONE
+        ,PO_SCHEDA_PEN.LIS_DATA_INI
+        ,PO_SCHEDA_PEN.LIS_VERSIONE
+        ,PO_SCHEDA_PEN.SOG_DATA_INI_INT
+        ,PO_SCHEDA_PEN.SOG_VERSIONE_INT
+        ,PO_SCHEDA_PEN.CAB_DATA_INI
+        ,PO_SCHEDA_PEN.CAB_VERSIONE
+        ,PO_SCHEDA_PEN.KPI_DATA_INI
+        ,PO_SCHEDA_PEN.KPI_VERSIONE
+        ,PO_SCHEDA_PEN.SOG_DATA_INI_EST
+        ,PO_SCHEDA_PEN.SOG_VERSIONE_EST
+        ,PO_SCHEDA_PEN.UOPL_DATA_INI
+        ,PO_SCHEDA_PEN.UOPL_VERSIONE
+        ,PO_SCHEDA_PEN.ALIN_DATA_INI
+        ,PO_SCHEDA_PEN.ALIN_VERSIONE
+        ,PO_SCHEDA_PEN.TSE_DATA_INI
+        ,PO_SCHEDA_PEN.TSE_VERSIONE
+        ,PO_SCHEDA_PEN.FORN_DATA_INI
+        ,PO_SCHEDA_PEN.FORN_VERSIONE
+        ,PO_SCHEDA_PEN.CONC_DATA_INI
+        ,PO_SCHEDA_PEN.CONC_VERSIONE
+        ,PO_SCHEDA_PEN.PROC_DATA_INI
+        ,PO_SCHEDA_PEN.PROC_VERSIONE
+        ,PO_SCHEDA_PEN.TPR_DATA_INI
+        ,PO_SCHEDA_PEN.TPR_VERSIONE
+        ,PO_SCHEDA_PEN.KIRS_DATA_INI
+        ,PO_SCHEDA_PEN.KIRS_VERSIONE
+        ,PO_SCHEDA_PEN.KCK_DATA_INI
+        ,PO_SCHEDA_PEN.KCK_VERSIONE
+        ,PO_SCHEDA_PEN.KDKPI_DATA_INI
+        ,PO_SCHEDA_PEN.KDKPI_VERSIONE
+        ,PO_SCHEDA_PEN.KLOT_DATA_INI
+        ,PO_SCHEDA_PEN.KLOT_VERSIONE
+        ,PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID
+        ,PO_SCHEDA_PEN.SCIN_DATA_INI
+        ,PO_SCHEDA_PEN.SCIN_VERSIONE
+        ,K_PIU_INFINITO--PO_SCHEDA_PEN.SCIN_DATA_FIN
+        ,K_MENO_INFINITO--PO_SCHEDA_PEN.SCIN_DATA_LIM
+        ,PO_SCHEDA_PEN.SCIN_DATAMODIFICA--PO_SCHEDA_PEN.SCIN_DATA_VER_INI
+        ,K_PIU_INFINITO--PO_SCHEDA_PEN.SCIN_DATA_VER_FIN
+        ,K_N
+        ,PO_SCHEDA_PEN.SCIN_DATAMODIFICA
+        ,PO_SCHEDA_PEN.VAL_VALORE_ID
+        ,PO_SCHEDA_PEN.VAL_DATA_INI
+        ,PO_SCHEDA_PEN.VAL_VERSIONE
+        ,PO_SCHEDA_PEN.SCIN_ID_VOCE_FATTURABILE
+        ,PO_SCHEDA_PEN.SCIN_DATA_SCADENZA_PAGAMENTO
+        ,PO_SCHEDA_PEN.DOC_DOCUMENTO_ID
+        ,PO_SCHEDA_PEN.DOC_DATA_INI
+        ,PO_SCHEDA_PEN.DOC_VERSIONE
+        ,PO_SCHEDA_PEN.SCIN_DATA_EMISSIONE_DOCUMENTO
+        ,PO_SCHEDA_PEN.SCIN_GG_SCOSTAMENTO
+        ,PO_SCHEDA_PEN.SCIN_NUM_FATTURAZIONI_PREVISTE
+        ,PO_SCHEDA_PEN.SCIN_NUM_FATTURAZIONI_ESEGUITE
+        ,PO_SCHEDA_PEN.CTSOS_TIPCAU_SOSP_ID
+        ,PO_SCHEDA_PEN.CTSOS_DATA_INI
+        ,PO_SCHEDA_PEN.CTSOS_VERSIONE
+        ,PO_SCHEDA_PEN.CLS_CLASSE_STRUMENTO_ID
+        ,PO_SCHEDA_PEN.CLS_DATA_INI
+        ,PO_SCHEDA_PEN.CLS_VERSIONE
+        ,PO_SCHEDA_PEN.SCIN_INDENNIZZO_CF
+        ,PO_SCHEDA_PEN.TUT_TIPO_UTILIZZO_ID
+        ,PO_SCHEDA_PEN.TUT_DATA_INI
+        ,PO_SCHEDA_PEN.TUT_VERSIONE
+        ,PO_SCHEDA_PEN.RMV_REMI_VIRTUALE_ID
+        ,PO_SCHEDA_PEN.RMV_DATA_INI
+        ,PO_SCHEDA_PEN.RMV_VERSIONE
+        ,PO_SCHEDA_PEN.IND_INDIRIZZO_ID
+        ,PO_SCHEDA_PEN.IND_DATA_INI
+        ,PO_SCHEDA_PEN.IND_VERSIONE
+        ,PO_SCHEDA_PEN.SCIN_INDENNIZZO_MAGGIORATO
+      );
+      --
+      vPasso := 'INSERISCI_REL_SOGG_SCHEDA';
+      INSERISCI_REL_SOGG_SCHEDA(
+          PO_ERR_SEVERITA
+        , PO_ERR_CODICE
+        , PO_MESSAGGIO
+        , P_LINGUAID
+        , P_OPEID
+        , P_RUOLOID
+        , P_CONTESTO
+        , PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID
+        , PO_SCHEDA_PEN.SOG_SOGGETTO_ID_INT
+        , PO_SCHEDA_PEN.SOG_DATA_INI_INT
+        , PO_SCHEDA_PEN.SOG_VERSIONE_INT
+        , NULL  -- SE LE RICAVA DA SOLO
+        , NULL  -- SE LE RICAVA DA SOLO
+        , V_ID_TOG
+        );
+      IF PO_MESSAGGIO IS NOT NULL THEN
+         RAISE V_ERRORE;
+      END IF;
+      --
+      --
+      KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'----------> INSERISCI_SINGOLA_SCHEDA_IND: ===> ID SCHEDA INSERITO: '||PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID||' '||PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD);
+      --
+    EXCEPTION
+        WHEN V_ERRORE THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'----------> INSERISCI_SINGOLA_SCHEDA_IND: ===> V_ERRORE al passo'||vPasso||': '||PO_MESSAGGIO);
+        WHEN OTHERS THEN
+          BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, '');
+    END INSERISCI_SINGOLA_SCHEDA_IND;
+    --
+  PROCEDURE INSERISCI_SINGOLA_SCHEDA_IND(
+      PO_ERR_SEVERITA                IN OUT   VARCHAR2,
+      PO_ERR_CODICE                  IN OUT   VARCHAR2,
+      PO_MESSAGGIO                   IN OUT   VARCHAR2,
+      P_LINGUAID                     IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                        IN       VARCHAR2,
+      P_RUOLOID                      IN       VARCHAR2,
+      P_SUPERUSER                    IN       VARCHAR2,
+      PO_EDW_PERMESSI                IN OUT NOCOPY  CLOB,
+      P_CONTESTO                     IN       CLOB,
+      P_SESSION_ID                   IN       VARCHAR2 := NULL,
+      P_KPI_ID                       IN       VARCHAR2 := NULL,
+      P_IDRICO                       IN       VARCHAR2 := NULL,
+      PO_SCHEDA_PEN                  IN OUT   NOCOPY KPI_T_EXT_SCHEDE_PEN,
+      PO_STATO_WKF_ID                IN OUT   NOCOPY VARCHAR2,
+      PO_STATO_PUBBLICO_ID           IN OUT   NOCOPY VARCHAR2
+    )
+    IS
+        V_PROC_NAME             VARCHAR2(100):= K_NOME_PACKAGE||'.INSERISCI_SINGOLA_SCHEDA_IND';
+        V_CONTESTO              EDW_CONTESTO_API_PCK.T_CONTESTO;
+        V_EDW_PERMESSIxml       XMLTYPE;
+    BEGIN
+      --
+      V_EDW_PERMESSIxml := Edw_Qbe_Api_Pck.CLOB2XMLTYPE( PO_EDW_PERMESSI);
+      --
+      V_CONTESTO := EDW_CONTESTO_API_PCK.deserializza( Edw_Qbe_Api_Pck.CLOB2XMLTYPE( P_CONTESTO));
+      --
+      INSERISCI_SINGOLA_SCHEDA_IND(
+          PO_ERR_SEVERITA      => PO_ERR_SEVERITA
+        , PO_ERR_CODICE        => PO_ERR_CODICE
+        , PO_MESSAGGIO         => PO_MESSAGGIO
+        , P_LINGUAID           => P_LINGUAID
+        , P_OPEID              => P_OPEID
+        , P_RUOLOID            => P_RUOLOID
+        , P_SUPERUSER          => P_SUPERUSER
+        , PO_EDW_PERMESSI      => V_EDW_PERMESSIxml
+        , P_CONTESTO           => V_CONTESTO
+        , PO_SCHEDA_PEN        => PO_SCHEDA_PEN
+        , PO_STATO_WKF_ID      => PO_STATO_WKF_ID
+        , PO_STATO_PUBBLICO_ID => PO_STATO_PUBBLICO_ID
+      );
+      --
+      --
+    EXCEPTION
+        WHEN OTHERS THEN
+          BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, '');
+    END INSERISCI_SINGOLA_SCHEDA_IND;
+    --
+    --
+    PROCEDURE INSERISCI_SCHEDE_INDENNIZZI(
+      PO_ERR_SEVERITA                IN OUT NOCOPY  VARCHAR2,
+      PO_ERR_CODICE                  IN OUT NOCOPY  VARCHAR2,
+      PO_MESSAGGIO                   IN OUT NOCOPY  VARCHAR2,
+      P_LINGUAID                     IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                        IN       VARCHAR2,
+      P_RUOLOID                      IN       VARCHAR2,
+      P_SUPERUSER                    IN       VARCHAR2,
+      PO_EDW_PERMESSI                IN OUT NOCOPY CLOB,
+      P_CONTESTO                     IN       CLOB,
+      P_TAB_SCHEDE_PEN               IN OUT NOCOPY KPI_SCHEDE_PEN_EXT_TAB
+    ) IS
+      V_PROC_NAME                 VARCHAR2(100);
+      vPasso                      varchar2(100);
+      V_STATO_WKF_ID              VARCHAR2(100);
+      V_STATO_PUBBLICO_ID         VARCHAR2(100);
+      --
+      V_EDW_PERMESSIxml       XMLTYPE;
+      V_CONTESTO              EDW_CONTESTO_API_PCK.T_CONTESTO;
+      --
+    BEGIN
+      --
+      --
+      V_EDW_PERMESSIxml := Edw_Qbe_Api_Pck.CLOB2XMLTYPE( PO_EDW_PERMESSI);
+      V_CONTESTO := EDW_CONTESTO_API_PCK.deserializza( Edw_Qbe_Api_Pck.CLOB2XMLTYPE( P_CONTESTO));
+      --
+      FOR I IN 1.. P_TAB_SCHEDE_PEN.COUNT LOOP
+        --
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK != 'OK' THEN CONTINUE; END IF;
+        --
+        vPasso := I||' INIT';
+        SAVEPOINT PRE_INS;
+        --
+        V_STATO_WKF_ID      := NULL;
+        V_STATO_PUBBLICO_ID := NULL;
+        --
+        INSERISCI_SINGOLA_SCHEDA_IND(
+            PO_ERR_SEVERITA => PO_ERR_SEVERITA
+          , PO_ERR_CODICE   => PO_ERR_CODICE
+          , PO_MESSAGGIO    => PO_MESSAGGIO
+          , P_LINGUAID      => P_LINGUAID
+          , P_OPEID         => P_OPEID
+          , P_RUOLOID       => P_RUOLOID
+          , P_SUPERUSER     => P_SUPERUSER
+          , PO_EDW_PERMESSI => V_EDW_PERMESSIxml
+          , P_CONTESTO      => V_CONTESTO
+          , PO_SCHEDA_PEN   => P_TAB_SCHEDE_PEN(I)
+          , PO_STATO_WKF_ID       => V_STATO_WKF_ID
+          , PO_STATO_PUBBLICO_ID  => V_STATO_PUBBLICO_ID
+        );
+        IF PO_MESSAGGIO IS NOT NULL THEN
+          ROLLBACK TO SAVEPOINT PRE_INS;
+          P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+          P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO := PO_MESSAGGIO;
+          PO_ERR_SEVERITA := NULL;
+          PO_ERR_CODICE := NULL;
+          PO_MESSAGGIO := NULL;
+        END IF;
+      END LOOP;
+    EXCEPTION
+      WHEN OTHERS THEN
+        BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END INSERISCI_SCHEDE_INDENNIZZI;
+    --
+  PROCEDURE EVOLVI_SINGOLA_SCHEDA_IND(
+      PO_ERR_SEVERITA                IN OUT   VARCHAR2,
+      PO_ERR_CODICE                  IN OUT   VARCHAR2,
+      PO_MESSAGGIO                   IN OUT   VARCHAR2,
+      P_LINGUAID                     IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                        IN       VARCHAR2,
+      P_RUOLOID                      IN       VARCHAR2,
+      P_SUPERUSER                    IN       VARCHAR2,
+      PO_EDW_PERMESSI                IN OUT   CLOB,
+      P_CONTESTO                     IN       CLOB,
+      P_KPI_ID                       IN       VARCHAR2,
+      P_IDRICO                       IN       VARCHAR2,
+      P_STATO_WKF_DEST_COD           IN       VARCHAR2,
+      PO_SCHEDA_PEN                  IN OUT  NOCOPY KPI_T_EXT_SCHEDE_PEN,
+      PO_STATO_WKF_ID                IN OUT  NOCOPY VARCHAR2,
+      PO_STATO_PUBBLICO_ID           IN OUT  NOCOPY VARCHAR2,
+      P_MOROSITA_SOG                 IN       VARCHAR2,
+      P_SCHEDA_DOPPIA                IN       VARCHAR2
+    ) IS
+        V_PROC_NAME                 VARCHAR2(100):= K_NOME_PACKAGE||'.EVOLVI_SINGOLA_SCHEDA_IND ';
+        vPasso                      VARCHAR2(100):= 'RICAVA_COMANDO';
+        V_COD_SCHEDA                VARCHAR2(16);
+        vStatoOri                   varchar2(35);
+        V_ID                        VARCHAR2(16);
+        V_STATO_PUBBLICO_COD        VARCHAR2(16);
+        V_ID_TOG                    VARCHAR2(16):= 'KPI_SCIN';
+        V_PROC_COD                  VARCHAR2(16);
+        V_ERRORE                    EXCEPTION;
+        V_USCITA                    EXCEPTION;
+        V_FLAG_MOROSO               BOOLEAN:= false;
+        V_COMANDO_STATO             VARCHAR2(16);
+        V_FK_KIRS                   EDW_QBE_API_PCK.tPk;
+        V_NOTA_STATO                VARCHAR2(255);
+        --
+        V_DML_KIRS                  EDW_QBE_API_PCK.tListaQBE;
+        V_DML_SCIN                  EDW_QBE_API_PCK.tListaQBE;
+        t                           EDW_QBE_API_PCK.tRecordQBE;
+        V_EDW_PERMESSI_XML      XMLTYPE;
+        V_CONTESTO_XML          XMLTYPE;
+        V_T_CONTESTO            EDW_CONTESTO_API_PCK.T_CONTESTO;
+    BEGIN
+      --
+      V_DML_KIRS (1) := t;
+      V_DML_SCIN (1) := t;
+      --
+      V_EDW_PERMESSI_XML     := EDW_QBE_API_PCK.CLOB2XMLTYPE(PO_EDW_PERMESSI);
+      V_T_CONTESTO := EDW_CONTESTO_API_PCK.deserializza(EDW_QBE_API_PCK.CLOB2XMLTYPE(P_CONTESTO));
+      --
+      vStatoOri := PO_SCHEDA_PEN.SCIN_STATO;
+      -- Ricavo il comando per evolvere la scheda
+      vPasso := 'RICAVA_COMANDO';
+      KPI_GESTIONE_INDENNIZZI_UTIL.RICAVA_COMANDO(
+          PO_ERR_SEVERITA
+        , PO_ERR_CODICE
+        , PO_MESSAGGIO
+        , P_LINGUAID
+        , P_OPEID
+        , P_RUOLOID
+        , P_SUPERUSER
+        , PO_EDW_PERMESSI
+        , P_CONTESTO
+        , PO_SCHEDA_PEN.SCIN_STATO-- 'CALCOLATO'
+        , P_STATO_WKF_DEST_COD-- SOSPESO
+        , V_COMANDO_STATO
+      );
+      IF PO_MESSAGGIO IS NOT NULL THEN
+         RAISE V_ERRORE;
+      END IF;
+      --
+      vPasso := 'V_DML_KIRS';
+        KPI_GESTIONE_INDENNIZZI_UTIL.ValorizzaQBE(V_DML_KIRS, 'StoricoIdKIRS', PO_SCHEDA_PEN.KIRS_IND_REL_STATO_ID, 1);
+        --
+      vPasso := 'V_DML_SCIN';
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'IdSCIN', PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_ID, 1);
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'DatamodificaSCIN', PO_SCHEDA_PEN.SCIN_DATAMODIFICA, 1);
+        KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN, 'StoricoIdKIRS', PO_SCHEDA_PEN.KIRS_IND_REL_STATO_ID, 1);
+        --
+        --AGGIUNGO AL V_DML_SCIN il flag che indica se il soggetto e' moroso e il flag che indica se si tratta
+        --di una scheda duplicata per lo stesso soggetto e nello stesso anno solare.
+        IF P_MOROSITA_SOG IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'MorositaSogSCIN',P_MOROSITA_SOG , 1);
+        END IF;
+        IF P_SCHEDA_DOPPIA IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'SchedaDoppiaSCIN',P_SCHEDA_DOPPIA, 1);
+        END IF;
+        IF P_SCHEDA_DOPPIA IS NOT NULL THEN
+          KPI_GESTIONE_INDENNIZZI_UTIL.VALORIZZAQBE(V_DML_SCIN,'StoricoIdCTSOS',PO_SCHEDA_PEN.CTSOS_TIPCAU_SOSP_ID, 1);
+        END IF;
+        --
+      vPasso := 'UPDATE_SCHEDA_SCIN_DB';
+      UPDATE_SCHEDA_SCIN_DB(
+          PO_ERR_SEVERITA       => PO_ERR_SEVERITA
+        , PO_ERR_CODICE         => PO_ERR_CODICE
+        , PO_MESSAGGIO          => PO_MESSAGGIO
+        , P_LINGUAID            => P_LINGUAID
+        , P_OPEID               => P_OPEID
+        , P_RUOLOID             => P_RUOLOID
+        , P_SUPERUSER           => P_SUPERUSER
+        , PO_EDW_PERMESSI       => V_EDW_PERMESSI_XML
+        , P_CONTESTO            => V_T_CONTESTO
+        , P_DATAMODIFICA        => NULL
+        , P_COMANDO_STATO       => V_COMANDO_STATO
+        , P_MODULO_ID           => P_KPI_ID
+        , PO_DML_KIRS           => V_DML_KIRS
+        , PO_DML_SCIN           => V_DML_SCIN
+        , PO_STATO_PUBBLICO_COD => V_STATO_PUBBLICO_COD
+        , PO_STATO_PUBBLICO_ID  => PO_STATO_PUBBLICO_ID
+        , PO_STATO_WKF_ID       => PO_STATO_WKF_ID
+      );
+      --
+      PO_SCHEDA_PEN.SCIN_DATAMODIFICA := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE_DATA(V_DML_SCIN, 'DataModificaSCIN', 1);
+      PO_SCHEDA_PEN.SCIN_STATO := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(V_DML_SCIN, 'StatoSCIN', 1);
+      PO_SCHEDA_PEN.KIRS_IND_REL_STATO_ID := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(V_DML_SCIN, 'StoricoIdKIRS', 1);
+      PO_SCHEDA_PEN.KIRS_DATA_INI := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE_DATA(V_DML_SCIN, 'DataIniKIRS', 1);
+      PO_SCHEDA_PEN.KIRS_VERSIONE := KPI_GESTIONE_INDENNIZZI_UTIL.GET_VALORE(V_DML_SCIN, 'VersioneKIRS', 1);
+      KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, V_PROC_NAME||' SCHEDA: '||PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD ||' DA '||vStatoOri  ||' a '|| P_STATO_WKF_DEST_COD||' OK');
+    EXCEPTION
+      WHEN V_ERRORE THEN
+          -- PROPAGO IL MESSAGGIO DI ERRORE
+          KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA,  V_PROC_NAME||' SCHEDA: '||PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD ||' DA '||vStatoOri  ||' a '|| P_STATO_WKF_DEST_COD||' ERRORE '||vPasso||' '||PO_MESSAGGIO);
+      WHEN OTHERS THEN
+          BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, K_NOME_PACKAGE||'.'||V_PROC_NAME, vPasso);
+          KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA,  V_PROC_NAME||' SCHEDA: '||PO_SCHEDA_PEN.SCIN_SCHEDA_PENALTY_COD ||' DA '||vStatoOri  ||' a '|| P_STATO_WKF_DEST_COD||' EXCEPTION '||vPasso||' '||PO_MESSAGGIO);
+    END EVOLVI_SINGOLA_SCHEDA_IND;
+    --
+    --
+    -- RicF 26/11/2011
+    -- PROCEDURA CHE CREA FISICAMENTE UNA SCHEDA PENALTY
+    -- QUESTA PROCEDURA è UTILIZZATA PER LA CREAZIONE DI SCHEDE PROVENIENTI DALLA VENDITA
+    -- SIA PER LA GENERAZIONE LOTTI CHE PER LA SINGOLA SCHEDA
+    --
+    PROCEDURE INS_SCHEDE_IND_CON_CONTROLLI(
+      PO_ERR_SEVERITA                IN OUT   VARCHAR2,
+      PO_ERR_CODICE                  IN OUT   VARCHAR2,
+      PO_MESSAGGIO                   IN OUT   VARCHAR2,
+      P_LINGUAID                     IN       EDW_LINGUE.LIN_LINGUA_ID%TYPE,
+      P_OPEID                        IN       VARCHAR2,
+      P_RUOLOID                      IN       VARCHAR2,
+      P_SUPERUSER                    IN       VARCHAR2,
+      PO_EDW_PERMESSI                IN OUT   NOCOPY XMLTYPE,
+      P_CONTESTO                     IN       CLOB,
+      P_T_CONTESTO                   IN       EDW_CONTESTO_API_PCK.T_CONTESTO,
+      P_ELAB_EFFETTIVO               IN       VARCHAR2,
+      P_EVOLVI_A_STATO               IN       VARCHAR2,
+      --
+      P_TAB_SCHEDE_PEN               IN OUT NOCOPY KPI_SCHEDE_PEN_EXT_TAB,
+      PO_SCHEDE_ELABORATE               OUT   NUMBER,
+      PO_SCHEDE_SCARTATE                OUT   NUMBER,
+      PO_PROC_INDEN                     OUT   NUMBER,  -- Numero processi indennizzabili
+      PO_INDEN_GEN                      OUT   NUMBER -- Numero indennizzi generati
+      )
+    IS
+        PO_ESITO_CONTROLLO        VARCHAR2(16);
+        V_PROC_NAME               VARCHAR2(100) := K_NOME_PACKAGE||'.INS_SCHEDE_IND_CON_CONTROLLI';
+        V_PAR_PROC_OPEN           CPA_PARAMETRIAPI.RPARAMETRI;  -- PARAMETRO KPI_IND_PROCOPEN
+        V_STATO_PUBBLICO_ID       VARCHAR2(16);
+        V_STATO_WKF_ID            VARCHAR2(16);
+        V_EDW_PERMESSI            CLOB;
+        V_PROC_SCARTATI           NUMBER:=0;
+        V_INDICE                  NUMBER:=0;
+        V_FLAG_MOROSO             BOOLEAN:= false;
+        V_NOTA_STATO              VARCHAR2(255);
+        PO_ESITO                  VARCHAR2(1000);
+        V_ERRORE                  EXCEPTION;
+        V_PROC_ANNO               NUMBER(5);
+        V_PROC_COD                VARCHAR2(16);
+        V_SCHEDA_COD              VARCHAR2(16);
+        V_IDRICO                  VARCHAR2(2) := 'N';
+        --
+        V_NOTEINDENNIZZO          VARCHAR(4000);
+        --
+        V_ESITO_FUORI_TEMPO       VARCHAR(5);
+        V_INDICE_FUORI_TEMPO      NUMBER := 0;
+        V_INDICE_IND_GEN          NUMBER := 0;
+        V_TAB_COUNT_PROC          SIUBASE.BASE_TAB_FK_TYPE := NEW SIUBASE.BASE_TAB_FK_TYPE(); --Tabella di appoggio per i processi fuori tempo causa esercente. Utilizzata per verificare se un processo e' stato gia' conteggiato
+        V_REC_COUNT_PROC          SIUBASE.BASE_REC_FK_TYPE := NEW BASE_REC_FK_TYPE();
+        V_COUNT_PROC              NUMBER;
+        vPasso                    varchar2(100);
+    BEGIN
+      --
+      V_EDW_PERMESSI := edw_qbe_api_pck.XMLTYPE2CLOB(PO_EDW_PERMESSI);
+      --
+      KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'----------> INS_SCHEDE_IND_CON_CONTROLLI: ===> NUMERO RECORD='||P_TAB_SCHEDE_PEN.COUNT);
+      --
+      V_PAR_PROC_OPEN := CPA_PARAMETRIAPI.GETPARAMETROVALORE( PO_MESSAGGIO, P_LINGUAID
+        , P_OPEID, P_RUOLOID, P_SUPERUSER, EDW_QBE_API_PCK.CLOB2XMLTYPE( P_CONTESTO), SYSTIMESTAMP
+        , SYSTIMESTAMP, 'KPI_IND_PROCOPEN', 'KPI_IND_PROCOPEN'
+      );
+      IF PO_MESSAGGIO IS NOT NULL  THEN RAISE V_ERRORE; END IF;
+      --
+      FOR I IN 1.. P_TAB_SCHEDE_PEN.COUNT LOOP
+        --
+        V_INDICE := V_INDICE + 1;
+        --
+        IF P_TAB_SCHEDE_PEN(I).FLAG_KO_OK = 'KO' THEN
+          V_PROC_SCARTATI:= V_PROC_SCARTATI + 1;
+          CONTINUE;
+        END IF;
+        --
+        --
+        vPasso := 'WRAPPER_CONTROLLA_DATI_SCHEDA';
+        KPI_GESTIONE_INDENNIZZI_UTIL.WRAPPER_CONTROLLA_DATI_SCHEDA( PO_ERR_SEVERITA
+          , PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, P_OPEID, P_RUOLOID, P_SUPERUSER, PO_EDW_PERMESSI
+          , P_CONTESTO, P_TAB_SCHEDE_PEN( I), P_TAB_SCHEDE_PEN, V_IDRICO, PO_ESITO, V_SCHEDA_COD
+          , V_PROC_ANNO, V_PROC_COD, V_ESITO_FUORI_TEMPO
+        );
+        IF PO_MESSAGGIO IS NOT NULL THEN
+            RAISE V_ERRORE;
+        END IF;
+        --
+        vPasso := 'V_ESITO_FUORI_TEMPO';
+        IF V_ESITO_FUORI_TEMPO = K_ESITO_OK THEN
+          --SE L'ESITO FUORI TEMPO CAUSA ESERCENTE HA DATO ESITO POSITIVO INCREMENTO L'INDICATORE
+          --DEGLI INDENNIZZABILI VERIFICANDO PRIMA CHE IL PROCESSO NON SIA GIA' STATO CONTEGGIATO
+          SELECT COUNT(*)
+            INTO V_COUNT_PROC
+            FROM TABLE(V_TAB_COUNT_PROC)
+           WHERE STORICO_ID = P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_ID;
+          IF V_COUNT_PROC = 0 THEN
+            V_REC_COUNT_PROC.STORICO_ID := P_TAB_SCHEDE_PEN(I).PROC_PROCESSO_ID;
+            V_TAB_COUNT_PROC.EXTEND(1);
+            V_INDICE_FUORI_TEMPO := V_INDICE_FUORI_TEMPO + 1;
+            V_TAB_COUNT_PROC(V_INDICE_FUORI_TEMPO) := V_REC_COUNT_PROC;
+          END IF;
+        END IF;
+        --
+        IF PO_ESITO NOT IN (K_ESITO_OK, K_ESITO_DOPPIA) THEN
+           V_PROC_SCARTATI:= V_PROC_SCARTATI + 1;
+           P_TAB_SCHEDE_PEN(I).FLAG_KO_OK := 'KO';
+           P_TAB_SCHEDE_PEN(I).ESITO_MESSAGGIO := PO_ESITO;
+        ELSIF NVL(P_ELAB_EFFETTIVO, 'n') != K_SI THEN
+          V_INDICE_IND_GEN := V_INDICE_IND_GEN + 1;
+          KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'----------> INS_SCHEDE_IND_CON_CONTROLLI: ===> P_ELAB_EFFETTIVO ='||P_ELAB_EFFETTIVO ||  ' !!INSERIMENTO NON ESEGUITO!!' );
+        ELSE -- Tutto Ok, devo salvare
+          --
+          V_STATO_PUBBLICO_ID  := NULL;
+          V_STATO_WKF_ID       := NULL;
+          vPasso := 'INSERISCI_SINGOLA_SCHEDA_IND';
+          INSERISCI_SINGOLA_SCHEDA_IND(
+              PO_ERR_SEVERITA => PO_ERR_SEVERITA
+            , PO_ERR_CODICE   => PO_ERR_CODICE
+            , PO_MESSAGGIO    => PO_MESSAGGIO
+            , P_LINGUAID      => P_LINGUAID
+            , P_OPEID         => P_OPEID
+            , P_RUOLOID       => P_RUOLOID
+            , P_SUPERUSER     => P_SUPERUSER
+            , PO_EDW_PERMESSI => PO_EDW_PERMESSI
+            , P_CONTESTO      => P_T_CONTESTO
+            , PO_SCHEDA_PEN   => P_TAB_SCHEDE_PEN(I)
+            , PO_STATO_WKF_ID       => V_STATO_WKF_ID
+            , PO_STATO_PUBBLICO_ID  => V_STATO_PUBBLICO_ID
+          );
+          IF PO_MESSAGGIO IS NOT NULL THEN RAISE V_ERRORE; END IF;
+          --
+          V_INDICE_IND_GEN := V_INDICE_IND_GEN + 1;
+          --
+          -- AGGIORNO IL RECORD DELLA KPI_CRONOLOGIA_KPI CON L'ID DEL PENALTY RICAVATO IN PRECEDENZA
+          -- ASSOCIATO AL PROCESSO E AL KPI ELABORATO
+          --
+          IF P_TAB_SCHEDE_PEN(I).KPEN_PENALTY_ID IS NOT NULL THEN
+              vPasso := 'AGGIORNA_CRONOLOGIA_PENALTY';
+              AGGIORNA_CRONOLOGIA_PENALTY( PO_ERR_SEVERITA, PO_ERR_CODICE
+                , PO_MESSAGGIO, P_LINGUAID, P_OPEID, P_RUOLOID, P_CONTESTO, P_TAB_SCHEDE_PEN( I).KPEN_PENALTY_ID
+                , P_TAB_SCHEDE_PEN( I).KPEN_DATA_INI, P_TAB_SCHEDE_PEN( I).KPEN_VERSIONE, P_TAB_SCHEDE_PEN( I).KCK_CRONOLOGIA_KPI_ID
+                , P_TAB_SCHEDE_PEN( I).KCK_DATA_INI, P_TAB_SCHEDE_PEN( I).KCK_VERSIONE
+              );
+              --
+              IF PO_MESSAGGIO IS NOT NULL THEN RAISE V_ERRORE; END IF;
+          END IF;
+          --
+          --
+          IF FALSE THEN --TODO VERIFICARE ANCHE IL TIPO PENALTY
+            -- TODO Gestire le schede doppie e/ o morose?
+            -- Procedura che verifica se l'utente è moroso
+            vPasso := 'VERIFICA_STATO_MOROSITA';
+            KPI_GESTIONE_INDENNIZZI_UTIL.VERIFICA_STATO_MOROSITA( PO_ERR_SEVERITA
+              , PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, P_OPEID, P_RUOLOID, P_CONTESTO, KPI_GESTIONE_INDENNIZZI_UTIL.V_SESSION_ID_GLOBAL
+              , P_TAB_SCHEDE_PEN( I).SCIN_IMPORTO_INDENNIZZO, P_TAB_SCHEDE_PEN( I).SOG_SOGGETTO_ID_INT
+              , P_TAB_SCHEDE_PEN( I).FORN_FORNITURA_ID, V_FLAG_MOROSO, V_IDRICO, V_NOTEINDENNIZZO
+            );
+            IF PO_MESSAGGIO IS NOT NULL THEN RAISE V_ERRORE; END IF;
+            --
+            IF PO_ESITO = K_ESITO_DOPPIA  OR V_FLAG_MOROSO = TRUE THEN
+              -- DEVO EVOLVERE IN SOSPESA
+              IF PO_ESITO = K_ESITO_DOPPIA THEN
+                IF V_FLAG_MOROSO = TRUE THEN
+                  V_NOTA_STATO:= EDW_LOGGER_PCK.DECODE_COD('KPIGIND040', FALSE, P_LINGUAID, 'CODICE_SCHEDA',  V_SCHEDA_COD, 'PROCESSO_ANNO', V_PROC_ANNO, 'PROCESSO_CODICE', V_PROC_COD);
+                ELSE
+                  V_NOTA_STATO:= EDW_LOGGER_PCK.DECODE_COD('KPIGIND041', FALSE, P_LINGUAID, 'CODICE_SCHEDA',  V_SCHEDA_COD, 'PROCESSO_ANNO', V_PROC_ANNO, 'PROCESSO_CODICE', V_PROC_COD);
+                END IF;
+              ELSE
+                IF V_FLAG_MOROSO = TRUE THEN
+                  IF P_TAB_SCHEDE_PEN(I).WKFI_PROC_CHIUSO = K_N AND V_PAR_PROC_OPEN.PIM_VALORE_PARAMETRO = 'S' THEN
+                    --SCHEDA IN STATO SOSPESO POICHE IL SOGGETTO RISULTA MOROSO E IL PROCESSO NON E CHIUSO
+                    V_NOTA_STATO:= EDW_LOGGER_PCK.DECODE_COD('KPIGIND031', FALSE, P_LINGUAID);
+                  ELSE
+                    --SCHEDA IN STATO SOSPESO POICHE' IL SOGGETTO RISULTA MOROSO
+                    V_NOTA_STATO:= EDW_LOGGER_PCK.DECODE_COD('KPIGIND030', FALSE, P_LINGUAID);
+                  END IF;
+                ELSE
+                  IF P_TAB_SCHEDE_PEN(I).WKFI_PROC_CHIUSO = K_N AND V_PAR_PROC_OPEN.PIM_VALORE_PARAMETRO = 'S' THEN
+                  --SCHEDA IN STATO SOSPESO POICHE'  IL PROCESSO RISULTA ESSERE APERTO
+                  V_NOTA_STATO:= EDW_LOGGER_PCK.DECODE_COD('KPIGIND032', FALSE, P_LINGUAID);
+                  END IF;
+                END IF;
+              END IF;
+              --
+              IF V_NOTEINDENNIZZO IS NOT NULL THEN
+                V_NOTA_STATO:= V_NOTA_STATO||' - '|| V_NOTEINDENNIZZO;
+              END IF;
+              P_TAB_SCHEDE_PEN(I).SCIN_NOTA_STATO := SUBSTR(P_TAB_SCHEDE_PEN(I).SCIN_NOTA_STATO|| kAccapo  || V_NOTA_STATO, 1, 255);
+              --
+              vPasso := 'EVOLVI_ SOSPESO';
+              EVOLVI_SINGOLA_SCHEDA_IND(
+                  PO_ERR_SEVERITA      => PO_ERR_SEVERITA
+                , PO_ERR_CODICE        => PO_ERR_CODICE
+                , PO_MESSAGGIO         => PO_MESSAGGIO
+                , P_LINGUAID           => P_LINGUAID
+                , P_OPEID              => P_OPEID
+                , P_RUOLOID            => P_RUOLOID
+                , P_SUPERUSER          => P_SUPERUSER
+                , PO_EDW_PERMESSI      => V_EDW_PERMESSI
+                , P_CONTESTO           => P_CONTESTO
+                , P_KPI_ID             => P_TAB_SCHEDE_PEN(I).KPI_KPI_ID
+                , P_IDRICO             => V_IDRICO
+                , P_STATO_WKF_DEST_COD => 'SOSPESO'
+                , PO_SCHEDA_PEN        => P_TAB_SCHEDE_PEN(I)
+                , PO_STATO_WKF_ID      => V_STATO_WKF_ID
+                , PO_STATO_PUBBLICO_ID => V_STATO_PUBBLICO_ID
+                , P_MOROSITA_SOG       => CASE V_FLAG_MOROSO WHEN true then 'S' ELSE 'N' END
+                , P_SCHEDA_DOPPIA      => CASE WHEN PO_ESITO = K_ESITO_DOPPIA then 'S' ELSE 'N' END
+              );
+              IF PO_MESSAGGIO IS NOT NULL THEN RAISE V_ERRORE; END IF;
+            END IF;
+          END IF;
+          --
+          IF V_STATO_PUBBLICO_ID = 'CALCOLATO' AND P_EVOLVI_A_STATO IS NOT NULL  THEN
+            -- Se sono ancora in CALCOLATO e se richiesto dal chiamante evolvo in P_EVOLVI_A_STATO
+            --
+            vPasso := 'EVOLVI_ VALIDATO';
+            EVOLVI_SINGOLA_SCHEDA_IND(
+                PO_ERR_SEVERITA      => PO_ERR_SEVERITA
+              , PO_ERR_CODICE        => PO_ERR_CODICE
+              , PO_MESSAGGIO         => PO_MESSAGGIO
+              , P_LINGUAID           => P_LINGUAID
+              , P_OPEID              => P_OPEID
+              , P_RUOLOID            => P_RUOLOID
+              , P_SUPERUSER          => P_SUPERUSER
+              , PO_EDW_PERMESSI      => V_EDW_PERMESSI
+              , P_CONTESTO           => P_CONTESTO
+              , P_KPI_ID             => P_TAB_SCHEDE_PEN(I).KPI_KPI_ID
+              , P_IDRICO             => V_IDRICO
+              , P_STATO_WKF_DEST_COD => P_EVOLVI_A_STATO
+              , PO_SCHEDA_PEN        => P_TAB_SCHEDE_PEN(I)
+              , PO_STATO_WKF_ID      => V_STATO_WKF_ID
+              , PO_STATO_PUBBLICO_ID => V_STATO_PUBBLICO_ID
+              , P_MOROSITA_SOG       => 'N'
+              , P_SCHEDA_DOPPIA      => 'N'
+            );
+            IF PO_MESSAGGIO IS NOT NULL THEN RAISE V_ERRORE; END IF;
+          END IF;
+        END IF;
+        --
+      END LOOP;
+      --
+      PO_SCHEDE_ELABORATE := V_INDICE - V_PROC_SCARTATI;
+      PO_SCHEDE_SCARTATE  := V_PROC_SCARTATI ;
+      PO_PROC_INDEN         := V_INDICE_FUORI_TEMPO;
+      PO_INDEN_GEN          := V_INDICE_IND_GEN;
+      --
+      KPI_GESTIONE_INDENNIZZI_UTIL.SCRIVI_LOG(GVL_ATTIVA, GLOB_STATO_EVOLUZIONE||': '||GLOB_ISTANZA||'----------> INS_SCHEDE_IND_CON_CONTROLLI: ===> PO_MESSAGGIO = '||PO_MESSAGGIO);
+    EXCEPTION
+        WHEN V_ERRORE THEN
+          NULL;
+        WHEN OTHERS THEN
+          BASE_SEGNALAZIONI_PCK.SEGNALA_ECCEZIONE_NO_PROC(PO_ERR_SEVERITA, PO_ERR_CODICE, PO_MESSAGGIO, P_LINGUAID, V_PROC_NAME, vPasso);
+    END INS_SCHEDE_IND_CON_CONTROLLI;
+    --
+END KPI_GESTIONE_INDEN_INS;
